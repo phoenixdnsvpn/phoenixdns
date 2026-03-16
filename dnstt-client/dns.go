@@ -7,21 +7,21 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	log "github.com/sirupsen/logrus"
 	"net"
+	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
 const (
-	// How many bytes of random padding to insert into queries.
-	numPadding = 3
-	// In an otherwise empty polling query, insert even more random padding,
-	// to reduce the chance of a cache hit. Cannot be greater than 31,
-	// because the prefix codes indicating padding start at 224.
-	numPaddingForPoll = 8
+	// pollNonceLen is the number of random bytes appended to poll queries
+	// for cache busting. Without this, empty polls would be identical and
+	// recursive resolvers would return cached (stale) responses.
+	pollNonceLen = 4
 
 	// sendLoop has a poll timer that automatically sends an empty polling
 	// query when a certain amount of time has elapsed without a send. The
@@ -62,6 +62,14 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// Forged response tracking
+	forgedCount     uint64
+	countSERVFAIL   uint64
+	countNXDOMAIN   uint64
+	countSuccess    uint64
+	countOtherError uint64
+	// Transport error reporting for session health monitoring
+	transportErr chan error
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -79,6 +87,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		clientID:        clientID,
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
+		transportErr:    make(chan error, 2),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
@@ -86,49 +95,66 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		if err != nil {
 			log.Errorf("recvLoop: %v", err)
 		}
+		select {
+		case c.transportErr <- fmt.Errorf("recvLoop: %w", err):
+		default:
+		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
 		if err != nil {
 			log.Errorf("sendLoop: %v", err)
 		}
+		select {
+		case c.transportErr <- fmt.Errorf("sendLoop: %w", err):
+		default:
+		}
 	}()
 	return c
 }
 
+// TransportErrors returns a channel that receives errors from the
+// underlying transport goroutines (recvLoop and sendLoop).
+func (c *DNSPacketConn) TransportErrors() <-chan error {
+	return c.transportErr
+}
+
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
-// into the RDATA of a TXT RR. It returns nil if the message doesn't pass format
-// checks, or if the name in its Question entry is not a subdomain of domain.
-func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
+// into the RDATA of a TXT RR. It returns (nil, true) when the response has a
+// non-NoError RCODE, indicating a forged or hijacked response. It returns
+// (payload, false) on success or (nil, false) when the response doesn't pass
+// format checks.
+func dnsResponsePayload(resp *dns.Message, domain dns.Name) ([]byte, bool) {
 	if resp.Flags&0x8000 != 0x8000 {
 		// QR != 1, this is not a response.
-		return nil
+		return nil, false
 	}
 	if resp.Flags&0x000f != dns.RcodeNoError {
-		return nil
+		// Non-zero RCODE indicates a forged or hijacked response.
+		return nil, true
 	}
 
 	if len(resp.Answer) != 1 {
-		return nil
+		return nil, false
 	}
 	answer := resp.Answer[0]
 
 	_, ok := answer.Name.TrimSuffix(domain)
 	if !ok {
 		// Not the name we are expecting.
-		return nil
+		return nil, false
 	}
 
 	if answer.Type != dns.RRTypeTXT {
 		// We only support TYPE == TXT.
-		return nil
+		return nil, false
 	}
 	payload, err := dns.DecodeRDataTXT(answer.Data)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 
-	return payload
+	return payload, false
 }
 
 // nextPacket reads the next length-prefixed packet from r. It returns a nil
@@ -159,29 +185,6 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 //
 // Whenever we receive a DNS response containing at least one data packet, we
 // send on c.pollChan to permit sendLoop to send an immediate polling queries.
-// KCP itself will also send an ACK packet for incoming data, which is
-// effectively a second poll. Therefore, each time we receive data, we send up
-// to 2 polling queries (or 1 + f polling queries, if KCP only ACKs an f
-// fraction of incoming data). We say "up to" because sendLoop will discard an
-// empty polling query if it has an organic non-empty packet to send (this goes
-// also for KCP's organic ACK packets).
-//
-// The intuition behind polling immediately after receiving is that if server
-// has just had something to send, it may have more to send, and in order for
-// the server to send anything, we must give it a query to respond to. The
-// intuition behind polling *2 times* (or 1 + f times) is similar to TCP slow
-// start: we want to maintain some number of queries "in flight", and the faster
-// the server is sending, the higher that number should be. If we polled only
-// once for each received packet, we would tend to have only one query in flight
-// at a time, ping-pong style. The first polling query replaces the in-flight
-// query that has just finished its duty in returning data to us; the second
-// grows the effective in-flight window proportional to the rate at which
-// data-carrying responses are being received. Compare to Eq. (2) of
-// https://tools.ietf.org/html/rfc5681#section-3.1. The differences are that we
-// count messages, not bytes, and we don't maintain an explicit window. If a
-// response comes back without data, or if a query or response is dropped by the
-// network, then we don't poll again, which decreases the effective in-flight
-// window.
 func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 	for {
 		var buf [4096]byte
@@ -201,7 +204,27 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			continue
 		}
 
-		payload := dnsResponsePayload(&resp, c.domain)
+		payload, isForged := dnsResponsePayload(&resp, c.domain)
+		if isForged {
+			rcode := resp.Flags & 0x000f
+			switch rcode {
+			case dns.RcodeServerFailure:
+				atomic.AddUint64(&c.countSERVFAIL, 1)
+			case dns.RcodeNameError:
+				atomic.AddUint64(&c.countNXDOMAIN, 1)
+			default:
+				atomic.AddUint64(&c.countOtherError, 1)
+			}
+			total := atomic.AddUint64(&c.forgedCount, 1)
+			log.Warnf("forged DNS response (rcode=%d, total forged=%d, SERVFAIL=%d, NXDOMAIN=%d, other=%d)",
+				rcode, total,
+				atomic.LoadUint64(&c.countSERVFAIL),
+				atomic.LoadUint64(&c.countNXDOMAIN),
+				atomic.LoadUint64(&c.countOtherError))
+			continue
+		}
+
+		atomic.AddUint64(&c.countSuccess, 1)
 
 		// Pull out the packets contained in the payload.
 		r := bytes.NewReader(payload)
@@ -216,9 +239,7 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		}
 
 		// If the payload contained one or more packets, permit sendLoop
-		// to poll immediately. ACKs on received data will effectively
-		// serve as another stream of polls whose rate is proportional
-		// to the rate of incoming packets.
+		// to poll immediately.
 		if any {
 			select {
 			case c.pollChan <- struct{}{}:
@@ -244,61 +265,35 @@ func chunks(p []byte, n int) [][]byte {
 }
 
 // send sends p as a single packet encoded into a DNS query, using
-// transport.WriteTo(query, addr). The length of p must be less than 224 bytes.
+// transport.WriteTo(query, addr).
 //
-// Here is an example of how a packet is encoded into a DNS name, using
+// Encoding format:
+//   - Data query:  [ClientID:2][DataLen:1][Data]
+//   - Poll query:  [ClientID:2][Nonce:4]  (4 random bytes for cache busting)
 //
-//	p = "supercalifragilisticexpialidocious"
-//	c.clientID = "CLIENTID"
-//	domain = "t.example.com"
-//
-// as the input.
-//
-//  0. Start with the raw packet contents.
-//
-//	supercalifragilisticexpialidocious
-//
-//  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
-//     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
-//     of L − 0xe0 bytes (not counting the length of the length prefix itself).
-//
-//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//
-//  2. Prefix the ClientID.
-//
-//	CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
-//
-//  3. Base32-encode, without padding and in lower case.
-//
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
-//
-//  4. Break into labels of at most 63 octets.
-//
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
-//
-//  5. Append the domain.
-//
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+// The encoded bytes are base32-encoded, split into 63-byte labels, and
+// appended with the tunnel domain to form the DNS query name.
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var decoded []byte
 	{
-		if len(p) >= 224 {
-			return fmt.Errorf("too long")
-		}
 		var buf bytes.Buffer
 		// ClientID
 		buf.Write(c.clientID[:])
-		n := numPadding
-		if len(p) == 0 {
-			n = numPaddingForPoll
-		}
-		// Padding / cache inhibition
-		buf.WriteByte(byte(224 + n))
-		io.CopyN(&buf, rand.Reader, int64(n))
-		// Packet contents
 		if len(p) > 0 {
+			// Data packet: length prefix + data
+			if len(p) > 255 {
+				return fmt.Errorf("too long")
+			}
 			buf.WriteByte(byte(len(p)))
 			buf.Write(p)
+		} else {
+			// Poll: random nonce for cache busting
+			nonce := make([]byte, pollNonceLen)
+			_, err := rand.Read(nonce)
+			if err != nil {
+				return err
+			}
+			buf.Write(nonce)
 		}
 		decoded = buf.Bytes()
 	}

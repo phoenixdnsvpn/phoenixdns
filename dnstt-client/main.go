@@ -171,9 +171,12 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	defer ln.Close()
 
-	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
-	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+	const clientIDSize = 2
+	const dataLenSize = 1
+	mtu := dnsNameCapacity(domain) - clientIDSize - dataLenSize
+	const kcpMinMTU = 50
+	if mtu < kcpMinMTU {
+		return fmt.Errorf("domain %s leaves only %d bytes for payload (minimum %d)", domain, mtu, kcpMinMTU)
 	}
 	log.Infof("effective MTU %d", mtu)
 

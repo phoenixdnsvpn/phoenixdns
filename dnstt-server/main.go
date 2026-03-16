@@ -56,11 +56,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	log "github.com/sirupsen/logrus"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/xtaci/kcp-go/v5"
@@ -113,6 +115,20 @@ var (
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// ServerStats tracks query processing statistics.
+type ServerStats struct {
+	total   uint64
+	success uint64
+}
+
+func (s *ServerStats) incTotal()   { atomic.AddUint64(&s.total, 1) }
+func (s *ServerStats) incSuccess() { atomic.AddUint64(&s.success, 1) }
+func (s *ServerStats) log() {
+	total := atomic.LoadUint64(&s.total)
+	success := atomic.LoadUint64(&s.success)
+	log.Debugf("stats | total: %d | success: %d", total, success)
+}
 
 // generateKeypair generates a private key and the corresponding public key. If
 // privkeyFilename and pubkeyFilename are respectively empty, it prints the
@@ -327,16 +343,11 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 	}
 }
 
-// nextPacket reads the next length-prefixed packet from r, ignoring padding. It
-// returns a nil error only when a packet was read successfully. It returns
-// io.EOF only when there were 0 bytes remaining to read from r. It returns
-// io.ErrUnexpectedEOF when EOF occurs in the middle of an encoded packet.
-//
-// The prefixing scheme is as follows. A length prefix L < 0xe0 means a data
-// packet of L bytes. A length prefix L >= 0xe0 means padding of L - 0xe0 bytes
-// (not counting the length of the length prefix itself).
+// nextPacket reads the next length-prefixed packet from r. It returns a nil
+// error only when a packet was read successfully. It returns io.EOF only when
+// there were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF
+// when EOF occurs in the middle of an encoded packet.
 func nextPacket(r *bytes.Reader) ([]byte, error) {
-	// Convert io.EOF to io.ErrUnexpectedEOF.
 	eof := func(err error) error {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -344,24 +355,13 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 		return err
 	}
 
-	for {
-		prefix, err := r.ReadByte()
-		if err != nil {
-			// We may return a real io.EOF only here.
-			return nil, err
-		}
-		if prefix >= 224 {
-			paddingLen := prefix - 224
-			_, err := io.CopyN(io.Discard, r, int64(paddingLen))
-			if err != nil {
-				return nil, eof(err)
-			}
-		} else {
-			p := make([]byte, int(prefix))
-			_, err = io.ReadFull(r, p)
-			return p, eof(err)
-		}
+	prefix, err := r.ReadByte()
+	if err != nil {
+		return nil, err
 	}
+	p := make([]byte, int(prefix))
+	_, err = io.ReadFull(r, p)
+	return p, eof(err)
 }
 
 // responseFor constructs a response dns.Message that is appropriate for query.
@@ -638,7 +638,7 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -649,6 +649,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			return err
 		}
+
+		stats.incTotal()
 
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
@@ -668,8 +670,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		n = copy(clientID[:], payload)
 		payload = payload[n:]
 		if n == len(clientID) {
-			// Discard padding and pull out the packets contained in
-			// the payload.
+			// Pull out the packets contained in the payload.
 			r := bytes.NewReader(payload)
 			for {
 				p, err := nextPacket(r)
@@ -688,6 +689,9 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
+			if resp.Rcode() == dns.RcodeNoError {
+				stats.incSuccess()
+			}
 			select {
 			case ch <- &record{resp, addr, clientID}:
 			default:
@@ -960,6 +964,15 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		fallbackMgr = NewFallbackManager(dnsConn, fallbackAddr)
 	}
 
+	stats := &ServerStats{}
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stats.log()
+		}
+	}()
+
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
@@ -970,7 +983,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr)
+	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats)
 }
 
 func main() {

@@ -250,6 +250,26 @@ If you use a system tor, the client SOCKS port will be 127.0.0.1:9050.
 If you use Tor Browser, it will be 127.0.0.1:9150.
 
 
+## Design decisions (dnstt-revived)
+
+1. **ClientID reduced from 8 to 2 bytes** — saves 6 bytes per query.
+   65,536 unique IDs; birthday-paradox collision at ~256 concurrent
+   clients is acceptable since DNS tunnels typically serve single-digit
+   clients per server.
+
+2. **Padding removed from data packets** — the old format added 3 random
+   padding bytes to data queries and 8 bytes to polls. The new format
+   uses no padding for data (the payload itself makes each query unique)
+   and a 4-byte random nonce for polls (cache busting). In the threat
+   model where query content is visible (UDP mode), the tunnel is
+   already detectable by its distinctive patterns regardless of padding.
+   In DoH/DoT mode, query content is encrypted making padding
+   irrelevant.
+
+3. **Wire protocol is incompatible with upstream dnstt** — client and
+   server must both be from dnstt-revived.
+
+
 ## Covertness
 
 Support for DoH and DoT is only to make it more difficult for a local
