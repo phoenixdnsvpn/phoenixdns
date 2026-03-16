@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +44,57 @@ const (
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
+// RateLimiter implements a token bucket rate limiter for DNS queries.
+type RateLimiter struct {
+	mu       sync.Mutex
+	tokens   float64
+	capacity float64
+	rate     float64 // tokens per second
+	lastTime time.Time
+}
+
+// NewRateLimiter creates a new token bucket rate limiter with the given
+// queries-per-second rate. Returns nil for non-positive or invalid values,
+// which means unlimited.
+func NewRateLimiter(rps float64) *RateLimiter {
+	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+		return nil
+	}
+	return &RateLimiter{
+		tokens:   rps,
+		capacity: rps,
+		rate:     rps,
+		lastTime: time.Now(),
+	}
+}
+
+// Wait blocks until a token is available. It is safe to call on a nil receiver
+// (no-op), which allows clean "unlimited" behavior without nil checks at call sites.
+func (rl *RateLimiter) Wait() {
+	if rl == nil {
+		return
+	}
+	for {
+		rl.mu.Lock()
+		now := time.Now()
+		elapsed := now.Sub(rl.lastTime).Seconds()
+		rl.lastTime = now
+		rl.tokens += elapsed * rl.rate
+		if rl.tokens > rl.capacity {
+			rl.tokens = rl.capacity
+		}
+		if rl.tokens >= 1.0 {
+			rl.tokens -= 1.0
+			rl.mu.Unlock()
+			return
+		}
+		needed := 1.0 - rl.tokens
+		waitTime := time.Duration(needed / rl.rate * float64(time.Second))
+		rl.mu.Unlock()
+		time.Sleep(waitTime)
+	}
+}
+
 // DNSPacketConn provides a packet-sending and -receiving interface over various
 // forms of DNS. It handles the details of how packets and padding are encoded
 // as a DNS name in the Question section of an upstream query, and as a TXT RR
@@ -62,6 +115,8 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// rateLimiter throttles outgoing DNS queries (nil = unlimited).
+	rateLimiter *RateLimiter
 	// maxQnameLen is the maximum total QNAME length in wire format (0 = 253 per RFC).
 	maxQnameLen int
 	// maxNumLabels is the maximum number of data labels (0 = unlimited).
@@ -86,7 +141,7 @@ type DNSPacketConn struct {
 // transport.WriteTo whenever a message needs to be sent.
 // maxQnameLen is the max total QNAME length (0 = 253 per RFC 1035).
 // maxNumLabels is the max number of data labels (0 = unlimited).
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, maxQnameLen int, maxNumLabels int) *DNSPacketConn {
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, rateLimiter *RateLimiter, maxQnameLen int, maxNumLabels int) *DNSPacketConn {
 	if maxQnameLen <= 0 || maxQnameLen > 253 {
 		maxQnameLen = 253
 	}
@@ -96,6 +151,7 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, 
 		clientID:        clientID,
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
+		rateLimiter:     rateLimiter,
 		maxQnameLen:     maxQnameLen,
 		maxNumLabels:    maxNumLabels,
 		transportErr:    make(chan error, 2),
@@ -435,6 +491,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// Unlike in the server, in the client we assume that because
 		// the data capacity of queries is so limited, it's not worth
 		// trying to send more than one packet per query.
+		c.rateLimiter.Wait()
 		err := c.send(transport, p, addr)
 		if err != nil {
 			log.Errorf("send: %v", err)

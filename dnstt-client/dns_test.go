@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"testing"
+	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
 )
@@ -66,6 +67,37 @@ func computeQueryNameLen(encodedLen int, domain dns.Name) int {
 		queryNameLen += 1 + len(label)
 	}
 	return queryNameLen
+}
+
+func TestRateLimiter(t *testing.T) {
+	rl := NewRateLimiter(100) // 100 rps
+	if rl == nil {
+		t.Fatal("expected non-nil rate limiter")
+	}
+
+	// Should be able to consume the initial burst quickly
+	start := time.Now()
+	for i := 0; i < 50; i++ {
+		rl.Wait()
+	}
+	elapsed := time.Since(start)
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("initial burst of 50 at 100 rps took %v, expected < 200ms", elapsed)
+	}
+}
+
+func TestRateLimiterNil(t *testing.T) {
+	// NewRateLimiter returns nil for invalid values
+	if NewRateLimiter(0) != nil {
+		t.Error("expected nil for rps=0")
+	}
+	if NewRateLimiter(-5) != nil {
+		t.Error("expected nil for negative rps")
+	}
+
+	// nil Wait() should not panic
+	var rl *RateLimiter
+	rl.Wait() // should be a no-op
 }
 
 func TestLabelConstraints(t *testing.T) {

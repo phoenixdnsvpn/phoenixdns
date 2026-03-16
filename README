@@ -429,3 +429,19 @@ with an error suggesting what to adjust.
 ```
 $ ./dnstt-client -max-qname-len 150 -max-num-labels 2 -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
+
+
+## Rate limiting (client)
+
+The client can limit the rate of outgoing DNS queries to avoid
+triggering rate limits or detection by resolvers and firewalls.
+
+  `-rps N`   Maximum DNS queries per second. Default: 0 (unlimited).
+
+When set, the client uses a token bucket rate limiter that smooths
+query output to the specified rate. A small burst (up to 1 second's
+worth of queries) is allowed to handle transient spikes.
+
+```
+$ ./dnstt-client -rps 50 -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+```

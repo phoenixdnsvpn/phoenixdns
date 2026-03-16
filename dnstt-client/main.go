@@ -287,6 +287,7 @@ func main() {
 	var utlsDistribution string
 	var maxQnameLen int
 	var maxNumLabels int
+	var rpsLimit float64
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -332,6 +333,7 @@ Known TLS fingerprints for -utls are:
 	flag.StringVar(&listenAddr, "listen", "", "TCP address to listen on for local connections (e.g., 127.0.0.1:7000)")
 	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
 	flag.IntVar(&maxNumLabels, "max-num-labels", 0, "maximum number of data labels in query name (0 = unlimited)")
+	flag.Float64Var(&rpsLimit, "rps", 0, "limit outgoing DNS queries per second (0 = unlimited)")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "warning", "log level (debug, info, warning, error)")
@@ -473,7 +475,11 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, maxQnameLen, maxNumLabels)
+	rateLimiter := NewRateLimiter(rpsLimit)
+	if rateLimiter != nil {
+		log.Infof("rate limiting DNS queries to %.1f requests per second", rpsLimit)
+	}
+	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
 	err = run(pubkey, domain, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels)
 	if err != nil {
 		log.Fatalf("%v", err)
