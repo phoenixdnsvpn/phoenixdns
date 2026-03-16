@@ -447,6 +447,25 @@ $ ./dnstt-client -rps 50 -doh https://doh.example/dns-query -pubkey-file server.
 ```
 
 
+## UDP transport options (client)
+
+By default, the -udp transport creates a fresh UDP socket for each DNS
+query, randomizing the source port. This makes the tunnel harder to
+fingerprint and more resilient to censorship injection.
+
+  -udp-workers N        Concurrent UDP workers. Default: 100.
+  -udp-timeout D        Per-query response timeout. Default: 1s.
+  -udp-shared-socket    Use a single shared UDP socket (old behavior).
+  -udp-accept-errors    Pass through DNS error responses instead of
+                        filtering them. By default, non-NOERROR
+                        responses (SERVFAIL, NXDOMAIN) are dropped,
+                        assuming they are forged by censorship.
+
+```
+$ ./dnstt-client -udp resolver.example:53 -udp-workers 50 -udp-timeout 500ms -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+```
+
+
 ## Session keepalive (client and server)
 
 Both client and server support configurable session timeouts:

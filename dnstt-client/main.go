@@ -62,12 +62,13 @@ import (
 )
 
 const (
-	defaultIdleTimeout   = 10 * time.Second
-	defaultKeepAlive     = 2 * time.Second
-	sessionCheckInterval = 500 * time.Millisecond
-	reconnectInitDelay   = 1 * time.Second
-	reconnectMaxDelay    = 2 * time.Minute
-	openStreamTimeout    = 3 * time.Second
+	defaultIdleTimeout       = 10 * time.Second
+	defaultKeepAlive         = 2 * time.Second
+	defaultUDPResponseTimeout = 1 * time.Second
+	sessionCheckInterval     = 500 * time.Millisecond
+	reconnectInitDelay       = 1 * time.Second
+	reconnectMaxDelay        = 2 * time.Minute
+	openStreamTimeout        = 3 * time.Second
 )
 
 // dnsNameCapacity returns the number of raw bytes that can be encoded in a DNS
@@ -249,7 +250,7 @@ func createTunnelSession(pconn net.PacketConn, remoteAddr net.Addr, pubkey []byt
 	return conn, sess, nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration, maxStreams int) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn, maxQnameLen int, maxNumLabels int, idleTimeout time.Duration, keepAlive time.Duration, maxStreams int, transportErrCh <-chan error) error {
 	defer pconn.Close()
 
 	const clientIDSize = 2
@@ -314,6 +315,8 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 					select {
 					case <-sessDone:
 						sessionAlive = false
+					case <-transportErrCh:
+						sessionAlive = false
 					default:
 					}
 					continue
@@ -327,6 +330,10 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 			// Check session health before spawning handler.
 			select {
 			case <-sessDone:
+				local.Close()
+				sessionAlive = false
+				continue
+			case <-transportErrCh:
 				local.Close()
 				sessionAlive = false
 				continue
@@ -367,6 +374,10 @@ func main() {
 	var idleTimeoutStr string
 	var keepAliveStr string
 	var maxStreams int
+	var udpWorkers int
+	var udpSharedSocket bool
+	var udpTimeoutStr string
+	var udpAcceptErrors bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -416,6 +427,10 @@ Known TLS fingerprints for -utls are:
 	flag.StringVar(&idleTimeoutStr, "idle-timeout", defaultIdleTimeout.String(), "session idle timeout duration (e.g. 10s, 1m)")
 	flag.StringVar(&keepAliveStr, "keepalive", defaultKeepAlive.String(), "keepalive ping interval (must be less than idle-timeout)")
 	flag.IntVar(&maxStreams, "max-streams", 256, "max concurrent streams per session (0 = unlimited)")
+	flag.IntVar(&udpWorkers, "udp-workers", 100, "number of concurrent UDP worker goroutines")
+	flag.BoolVar(&udpSharedSocket, "udp-shared-socket", false, "use a single shared UDP socket instead of per-query sockets")
+	flag.StringVar(&udpTimeoutStr, "udp-timeout", defaultUDPResponseTimeout.String(), "per-query UDP response timeout (e.g. 200ms, 1s)")
+	flag.BoolVar(&udpAcceptErrors, "udp-accept-errors", false, "accept DNS error responses instead of filtering them")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "warning", "log level (debug, info, warning, error)")
@@ -534,7 +549,15 @@ Known TLS fingerprints for -utls are:
 			if err != nil {
 				return nil, nil, err
 			}
-			pconn, err := net.ListenUDP("udp", nil)
+			if udpSharedSocket {
+				pconn, err := net.ListenUDP("udp", nil)
+				return addr, pconn, err
+			}
+			udpTimeout, err := time.ParseDuration(udpTimeoutStr)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid -udp-timeout: %v", err)
+			}
+			pconn, err := NewUDPPacketConn(addr, nil, udpWorkers, udpTimeout, !udpAcceptErrors)
 			return addr, pconn, err
 		}},
 	} {
@@ -576,8 +599,8 @@ Known TLS fingerprints for -utls are:
 	if rateLimiter != nil {
 		log.Infof("rate limiting DNS queries to %.1f requests per second", rpsLimit)
 	}
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive, maxStreams)
+	dnsPconn := NewDNSPacketConn(pconn, remoteAddr, domain, rateLimiter, maxQnameLen, maxNumLabels)
+	err = run(pubkey, domain, localAddr, remoteAddr, dnsPconn, maxQnameLen, maxNumLabels, idleTimeout, keepAlive, maxStreams, dnsPconn.TransportErrors())
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
