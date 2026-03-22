@@ -231,21 +231,19 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) ([]byte, bool) {
 // were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF when
 // EOF occurs in the middle of an encoded packet.
 func nextPacket(r *bytes.Reader) ([]byte, error) {
-	for {
-		var n uint16
-		err := binary.Read(r, binary.BigEndian, &n)
-		if err != nil {
-			// We may return a real io.EOF only here.
-			return nil, err
-		}
-		p := make([]byte, n)
-		_, err = io.ReadFull(r, p)
-		// Here we must change io.EOF to io.ErrUnexpectedEOF.
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return p, err
+	var n uint16
+	err := binary.Read(r, binary.BigEndian, &n)
+	if err != nil {
+		// We may return a real io.EOF only here.
+		return nil, err
 	}
+	p := make([]byte, n)
+	_, err = io.ReadFull(r, p)
+	// Here we must change io.EOF to io.ErrUnexpectedEOF.
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return p, err
 }
 
 // recvLoop repeatedly calls transport.ReadFrom to receive a DNS message,

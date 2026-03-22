@@ -147,7 +147,7 @@ func (c *HTTPPacketConn) sendLoop() {
 		c.notBeforeLock.RLock()
 		notBefore := c.notBefore
 		c.notBeforeLock.RUnlock()
-		if wait := notBefore.Sub(time.Now()); wait > 0 {
+		if time.Until(notBefore) > 0 {
 			// Drop it.
 			continue
 		}
