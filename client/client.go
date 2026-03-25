@@ -41,13 +41,13 @@ import (
 
 // Default timeouts for VayDNS mode.
 const (
-	DefaultIdleTimeout          = 10 * time.Second
-	DefaultKeepAlive            = 2 * time.Second
+	DefaultIdleTimeout          = 60 * time.Second
+	DefaultKeepAlive            = 10 * time.Second
 	DefaultOpenStreamTimeout    = 10 * time.Second
 	DefaultReconnectDelay       = 1 * time.Second
 	DefaultReconnectMaxDelay    = 30 * time.Second
-	DefaultSessionCheckInterval = 500 * time.Millisecond
-	DefaultUDPResponseTimeout   = 400 * time.Millisecond
+	DefaultSessionCheckInterval = 20 * time.Second
+	DefaultUDPResponseTimeout   = 500 * time.Millisecond
 	DefaultUDPWorkers           = 100
 	DefaultMaxStreams            = 256
 )
