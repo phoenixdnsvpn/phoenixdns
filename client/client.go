@@ -190,6 +190,7 @@ type Tunnel struct {
 
 	// internal state
 	wireConfig    turbotunnel.WireConfig
+	forgedStats   *ForgedStats
 	resolverConn  net.PacketConn
 	dnsPacketConn *DNSPacketConn
 	kcpConn       *kcp.UDPSession
@@ -270,10 +271,11 @@ func (t *Tunnel) InitiateResolverConnection() error {
 			if timeout <= 0 {
 				timeout = DefaultUDPResponseTimeout
 			}
-			conn, err := NewUDPPacketConn(addr, r.DialerControl, workers, timeout, !r.UDPAcceptErrors)
+			conn, forgedStats, err := NewUDPPacketConn(addr, r.DialerControl, workers, timeout, !r.UDPAcceptErrors)
 			if err != nil {
 				return err
 			}
+			t.forgedStats = forgedStats
 			t.resolverConn = conn
 		}
 		return nil
@@ -327,7 +329,7 @@ func (t *Tunnel) InitiateDNSPacketConn(domain dns.Name) error {
 		rateLimiter = NewRateLimiter(t.TunnelServer.RPS)
 	}
 	maxQnameLen := t.TunnelServer.effectiveMaxQnameLen()
-	t.dnsPacketConn = NewDNSPacketConn(t.resolverConn, t.remoteAddr, domain, rateLimiter, maxQnameLen, t.TunnelServer.MaxNumLabels, t.wireConfig)
+	t.dnsPacketConn = NewDNSPacketConn(t.resolverConn, t.remoteAddr, domain, rateLimiter, maxQnameLen, t.TunnelServer.MaxNumLabels, t.wireConfig, t.forgedStats)
 	return nil
 }
 
