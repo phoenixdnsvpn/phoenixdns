@@ -180,8 +180,8 @@ These flags only apply when using `-udp`. By default, each query is sent from a 
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | `-udp-workers N`     | Concurrent UDP worker goroutines                                                                                                                           | `100`   |
 | `-udp-timeout D`     | Per-query response timeout — the time a worker waits for a valid (NOERROR) response. The deadline resets after each forged response, so injected errors don't eat into the budget for the real response. | `500ms` |
-| `-udp-shared-socket` | Use a single shared UDP socket instead of per-query sockets                                                                                                | `false` |
-| `-udp-accept-errors` | Pass through DNS error responses (SERVFAIL, NXDOMAIN) instead of dropping them as forged                                                                   | `false` |
+| `-udp-shared-socket` | Use a single shared UDP socket instead of per-query sockets. By default, each query is sent from a new socket with a random ephemeral source port, making the tunnel harder to fingerprint or block by port. With this flag, all queries share one socket and source port for the lifetime of the client — blocking that port kills the tunnel. | `false` |
+| `-udp-accept-errors` | In per-query mode, accept the first DNS response regardless of RCODE instead of waiting for a NOERROR response. This disables forged response filtering — the worker stops waiting after the first forged response, so the real response is likely lost. Only useful for debugging; not recommended in production. Ignored when `-udp-shared-socket` is set. | `false` |
 
 #### QNAME constraints
 
