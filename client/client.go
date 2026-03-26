@@ -1,8 +1,8 @@
 // Package client provides a reusable DNS tunnel client library.
 //
-// The API is compatible with github.com/mahsanet/dnstt/client, with additional
-// configuration options for VayDNS features (DoH/DoT transports, per-query UDP,
-// forged response filtering, rate limiting, dnstt wire compatibility, etc.).
+// It provides configuration options for VayDNS features (DoH/DoT transports,
+// per-query UDP, forged response filtering, rate limiting, dnstt wire
+// compatibility, etc.).
 //
 // Basic usage (xray-core compatible):
 //
@@ -762,7 +762,7 @@ func UTLSClientHelloIDMap() []struct {
 }
 
 // Outbound provides a high-level API for creating tunnels from multiple
-// resolvers and tunnel servers. Compatible with mahsanet/dnstt.
+// resolvers and tunnel servers.
 type Outbound struct {
 	Resolvers     []Resolver
 	TunnelServers []TunnelServer

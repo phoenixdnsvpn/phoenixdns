@@ -392,6 +392,10 @@ All three can be explicitly overridden even when `-dnstt-compat` is set — the 
 | Poll packet | `[ClientID][Nonce:4]` | `[ClientID][224+8][Padding:8]` |
 | Max data/query | 255 bytes | 223 bytes |
 
+## Client library
+
+The `client` package (`github.com/net2share/vaydns/client`) provides a reusable Go library for embedding VayDNS in other applications. See [docs/client-library.md](docs/client-library.md) for usage and examples.
+
 ## E2E tests
 
 End-to-end tests run the full tunnel stack in Docker containers. Requires Docker.
