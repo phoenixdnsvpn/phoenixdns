@@ -1,26 +1,26 @@
-// dnstt-server is the server end of a DNS tunnel.
+// vaydns-server is the server end of a DNS tunnel.
 //
 // Usage:
 //
-//	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
+//	vaydns-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
+//	vaydns-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-fallback FALLBACKADDR] -domain DOMAIN -upstream UPSTREAMADDR
 //
 // Example:
 //
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-//	dnstt-server -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+//	vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
+//	vaydns-server -udp :53 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 //
 // With fallback for non-DNS traffic:
 //
-//	dnstt-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
+//	vaydns-server -udp :53 -privkey-file server.key -fallback 127.0.0.1:8888 -domain t.example.com -upstream 127.0.0.1:8000
 //
 // To generate a persistent server private key, first run with the -gen-key
 // option. By default the generated private and public keys are printed to
 // standard output. To save them to files instead, use the -privkey-file and
 // -pubkey-file options.
 //
-//	dnstt-server -gen-key
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
+//	vaydns-server -gen-key
+//	vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
 //
 // You can give the server's private key as a file or as a hex string.
 //
