@@ -73,8 +73,8 @@ import (
 )
 
 const (
-	defaultIdleTimeout = 60 * time.Second
-	defaultKeepAlive   = 10 * time.Second
+	defaultIdleTimeout = 10 * time.Second
+	defaultKeepAlive   = 2 * time.Second
 	// Bound the pre-smux handshake so half-open KCP sessions cannot linger
 	// indefinitely and consume server resources.
 	defaultHandshakeTimeout = 15 * time.Second
@@ -1395,8 +1395,8 @@ Example:
 			fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 			os.Exit(1)
 		}
-		if queueSize <= 0 {
-			fmt.Fprintf(os.Stderr, "-queue-size (%d) must be greater than 0\n", queueSize)
+		if queueSize < 32 {
+			fmt.Fprintf(os.Stderr, "-queue-size (%d) must be at least 32\n", queueSize)
 			os.Exit(1)
 		}
 		if kcpWindowSize < 0 {

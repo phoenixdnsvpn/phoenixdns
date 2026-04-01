@@ -68,7 +68,23 @@ Examples:
   %[1]s -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 
 `, os.Args[0])
-		flag.PrintDefaults()
+		flag.CommandLine.VisitAll(func(f *flag.Flag) {
+			if f.Name == "session-check-interval" {
+				return
+			}
+			fmt.Fprintf(flag.CommandLine.Output(), "  -%s", f.Name)
+			name, usage := flag.UnquoteUsage(f)
+			if len(name) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), " %s", name)
+			}
+			if len(f.DefValue) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), " (default %s)", f.DefValue)
+			}
+			if len(usage) > 0 {
+				fmt.Fprintf(flag.CommandLine.Output(), "\n    \t%s", usage)
+			}
+			fmt.Fprint(flag.CommandLine.Output(), "\n")
+		})
 		labels := make([]string, 0)
 		labels = append(labels, "none")
 		for _, entry := range client.UTLSClientHelloIDMap() {
