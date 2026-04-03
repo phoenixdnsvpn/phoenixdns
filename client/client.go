@@ -200,8 +200,8 @@ type Tunnel struct {
 	MaxStreams           int                           // default: 0 (0 = unlimited)
 	ReconnectMinDelay    time.Duration                 // default: 1s
 	ReconnectMaxDelay    time.Duration                 // default: 30s
-	SessionCheckInterval time.Duration                 // default: 20s
-	HandshakeTimeout     time.Duration                 // default: 30s
+	SessionCheckInterval time.Duration                 // default: 500ms
+	HandshakeTimeout     time.Duration                 // default: 15s
 	PacketQueueSize      int                           // default: QueueSize (512)
 	KCPWindowSize        int                           // default: PacketQueueSize/2
 	QueueOverflowMode    turbotunnel.QueueOverflowMode // default: drop
