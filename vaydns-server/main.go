@@ -30,10 +30,10 @@
 // The -udp option controls the address that will listen for incoming DNS
 // queries.
 //
-// The -mtu option controls the maximum size of response UDP payloads.
+// The -download-max-mtu option controls the maximum size of response UDP payloads.
 // Queries that do not advertise requester support for responses of at least
 // this size at least this size will be responded to with a FORMERR. The default
-// value is maxUDPPayload.
+// value is 1232.
 //
 // The -fallback option specifies a UDP address (host:port). If an incoming
 // packet is not a valid DNS message, it will be forwarded to this address.
@@ -58,6 +58,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,20 +101,12 @@ const (
 )
 
 var (
-	// We don't send UDP payloads larger than this, in an attempt to avoid
-	// network-layer fragmentation. 1280 is the minimum IPv6 MTU, 40 bytes
-	// is the size of an IPv6 header (though without any extension headers),
-	// and 8 bytes is the size of a UDP header.
-	//
-	// Control this value with the -mtu command-line option.
-	//
-	// https://dnsflagday.net/2020/#message-size-considerations
-	// "An EDNS buffer size of 1232 bytes will avoid fragmentation on nearly
-	// all current networks."
-	//
-	// On 2020-04-19, the Quad9 resolver was seen to have a UDP payload size
-	// of 1232. Cloudflare's was 1452, and Google's was 4096.
-	maxUDPPayload = 1280 - 40 - 8
+	// MTU Settings - These dictate the server's UDP response maximums
+	// and are bounded by the command line flags to support symmetric probing.
+	uploadMinMTU   = 40
+	uploadMaxMTU   = 140
+	downloadMinMTU = 200
+	downloadMaxMTU = 1232 // Replaces maxUDPPayload limit
 
 	// recordType is the DNS record type used for downstream data encoding.
 	// Set from the -record-type command-line flag.
@@ -420,9 +413,9 @@ func nextPacketDnstt(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
-	responsePayloadSize := uint16(maxUDPPayload)
-	if int(responsePayloadSize) != maxUDPPayload {
+func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte, dns.Name) {
+	responsePayloadSize := uint16(downloadMaxMTU)
+	if int(responsePayloadSize) != downloadMaxMTU {
 		responsePayloadSize = 0xffff
 	}
 
@@ -433,8 +426,8 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	}
 
 	if query.Flags&0x8000 != 0 {
-		// QR != 0, this is not a query. Don't even send a response.
-		return nil, nil
+		// QR != 0, this is not a query. Don't even send a response.	
+		return nil, nil, nil
 	}
 
 	// Check for EDNS(0) support. Include our own OPT RR only if we receive
@@ -452,10 +445,10 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		if len(resp.Additional) != 0 {
 			// https://tools.ietf.org/html/rfc6891#section-6.1.1
 			// "If a query message with more than one OPT RR is
-			// received, a FORMERR (RCODE=1) MUST be returned."
+			// received, a FORMERR (RCODE=1) MUST be returned."		
 			resp.Flags |= dns.RcodeFormatError
 			log.Debugf("FORMERR: more than one OPT RR")
-			return resp, nil
+			return resp, nil, nil
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
@@ -471,13 +464,12 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// https://tools.ietf.org/html/rfc6891#section-6.1.1
 			// "If a responder does not implement the VERSION level
 			// of the request, then it MUST respond with
-			// RCODE=BADVERS."
+			// RCODE=BADVERS."		
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
 			log.Debugf("BADVERS: EDNS version %d != 0", version)
-			return resp, nil
+			return resp, nil, nil
 		}
-
 		payloadSize = int(rr.Class)
 	}
 	if payloadSize < 512 {
@@ -487,32 +479,46 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	}
 	// We will return RcodeFormatError if payloadSize is too small, but
 	// first, check the name in order to set the AA bit properly.
-
+		
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
 		log.Debugf("FORMERR: too few or too many questions (%d)", len(query.Question))
-		return resp, nil
+		return resp, nil, nil
 	}
 	question := query.Question[0]
+
+	// LOOP THROUGH ALL CONFIGURED DOMAINS TO FIND A MATCH
+	var prefix [][]byte
+	var matchedDomain dns.Name
+	var ok bool
+
 	// Check the name to see if it ends in our chosen domain, and extract
 	// all that comes before the domain if it does. If it does not, we will
 	// return RcodeNameError below, but prefer to return RcodeFormatError
 	// for payload size if that applies as well.
-	prefix, ok := question.Name.TrimSuffix(domain)
+	for _, d := range domains {
+		prefix, ok = question.Name.TrimSuffix(d)
+		if ok {
+			matchedDomain = d
+			break
+		}
+	}
+
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
 		log.Debugf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil
+		return resp, nil, nil
 	}
+	
 	resp.Flags |= 0x0400 // AA = 1
 
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
 		log.Debugf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
-		return resp, nil
+		return resp, nil, nil
 	}
 
 	if question.Type != recordType {
@@ -521,8 +527,8 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		// No log message here; it's common for recursive resolvers to
 		// send NS or A queries when the client only asked for a TXT. I
 		// suspect this is related to QNAME minimization, but I'm not
-		// sure. https://tools.ietf.org/html/rfc7816
-		return resp, nil
+		// sure. https://tools.ietf.org/html/rfc7816		
+		return resp, nil, nil
 	}
 
 	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
@@ -532,7 +538,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		// Base32 error, make like the name doesn't exist.
 		resp.Flags |= dns.RcodeNameError
 		log.Debugf("NXDOMAIN: base32 decoding: %v", err)
-		return resp, nil
+		return resp, nil, nil
 	}
 	payload = payload[:n]
 
@@ -542,13 +548,13 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// problem with processing the OPT record itself, such as an option
 	// value that is badly formatted or that includes out-of-range values, a
 	// FORMERR MUST be returned."
-	if payloadSize < maxUDPPayload {
+	if payloadSize < downloadMaxMTU {
 		resp.Flags |= dns.RcodeFormatError
-		log.Debugf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
-		return resp, nil
+		log.Debugf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, downloadMaxMTU)
+		return resp, nil, nil
 	}
 
-	return resp, payload
+	return resp, payload, matchedDomain // RETURN THE MATCHED DOMAIN
 }
 
 // record represents a DNS message appropriate for a response to a previously
@@ -560,6 +566,7 @@ type record struct {
 	Resp     *dns.Message
 	Addr     net.Addr
 	ClientID turbotunnel.ClientID
+	Domain   dns.Name
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -693,7 +700,8 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
+
+func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -719,7 +727,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
+		resp, payload, matchedDomain := responseFor(&query, domains)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		if len(payload) < wireConfig.ClientIDSize {
@@ -744,6 +752,41 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				if err != nil {
 					break
 				}
+
+				// --- START DYNAMIC MTU INTERCEPTOR ---
+				// Magic Header: 0xFF 0xFF 0xFF 0xFF
+				if len(p) >= 9 && bytes.HasPrefix(p, []byte{0xFF, 0xFF, 0xFF, 0xFF}) {
+					probeType := p[4]
+					code := p[5:9]
+
+					var respProbe []byte
+					if probeType == 0x01 { // ProbeUpReq
+						respProbe = make([]byte, 11)
+						copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+						respProbe[4] = 0x02 // ProbeUpRes
+						copy(respProbe[5:9], code)
+						binary.BigEndian.PutUint16(respProbe[9:11], uint16(len(p)))
+					} else if probeType == 0x03 { // ProbeDownReq
+						if len(p) >= 11 {
+							reqSize := int(binary.BigEndian.Uint16(p[9:11]))
+							if reqSize > downloadMaxMTU {
+								reqSize = downloadMaxMTU // Sanity bound
+							}
+							respProbe = make([]byte, reqSize)
+							copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+							respProbe[4] = 0x04 // ProbeDownRes
+							copy(respProbe[5:9], code)
+						}
+					}
+
+					if respProbe != nil {
+						// Write directly back to the turbotunnel outgoing queue, bypassing KCP
+						ttConn.WriteTo(respProbe, clientID)
+					}
+					continue // Skip feeding this probe to KCP
+				}
+				// --- END DYNAMIC MTU INTERCEPTOR ---
+
 				// Feed the incoming packet to KCP.
 				ttConn.QueueIncoming(p, clientID)
 			}
@@ -754,7 +797,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 				stats.incSuccess()
 			}
 			select {
-			case ch <- &record{resp, addr, clientID}:
+			//case ch <- &record{resp, addr, clientID}:
+			case ch <- &record{resp, addr, clientID, matchedDomain}:
 			default:
 			}
 		}
@@ -821,7 +865,7 @@ func encodeResponsePayload(rec *record, data []byte, domain dns.Name) error {
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, domain dns.Name) error {
+func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) error {
 	var nextRec *record
 	for {
 		rec := nextRec
@@ -914,7 +958,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 			timer.Stop()
 
-			if err := encodeResponsePayload(rec, payload.Bytes(), domain); err != nil {
+			// PASS THE SPECIFIC DOMAIN FOR THIS QUERY TO ENCODER
+			
+			if err := encodeResponsePayload(rec, payload.Bytes(),  rec.Domain); err != nil {
 				log.Errorf("encode response: %v", err)
 				continue
 			}
@@ -927,9 +973,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
-		if len(buf) > maxUDPPayload {
-			log.Warnf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
-			buf = buf[:maxUDPPayload]
+		if len(buf) > downloadMaxMTU {
+			log.Warnf("truncating response of %d bytes to max of %d", len(buf), downloadMaxMTU)
+			buf = buf[:downloadMaxMTU]
 			buf[2] |= 0x02 // TC = 1
 		}
 
@@ -951,7 +997,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 }
 
 // computeMaxEncodedPayload computes the maximum amount of downstream single-RR
-// payload that keeps the overall response size less than maxUDPPayload, in the
+// payload that keeps the overall response size less than downloadMaxMTU, in the
 // worst case when the response answers a query that has a maximum-length name
 // in its Question section. Returns 0 in the case that no amount of data makes
 // the overall response size small enough.
@@ -1005,7 +1051,7 @@ func computeMaxEncodedPayload(limit int, encode func([]byte) []byte) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _, _ := responseFor(query, []dns.Name{})
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -1092,7 +1138,7 @@ func computeMaxEncodedPayloadMultiRR(limit int, chunkSize int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _, _ := responseFor(query, []dns.Name{})
 
 	// Binary search: find max payload that fits when split into chunkSize RRs.
 	low := 0
@@ -1125,7 +1171,7 @@ func computeMaxEncodedPayloadMultiRR(limit int, chunkSize int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration, queueSize int, kcpWindowSize int, queueOverflowMode turbotunnel.QueueOverflowMode, wireConfig turbotunnel.WireConfig) error {
+func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration, queueSize int, kcpWindowSize int, queueOverflowMode turbotunnel.QueueOverflowMode, wireConfig turbotunnel.WireConfig) error {
 	defer dnsConn.Close()
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1135,22 +1181,35 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	// query's Question section, which is of variable length. But we cannot
 	// give dynamic packet size limits to KCP; the best we can do is set a
 	// global maximum which no packet will exceed. We choose that maximum to
-	// keep the UDP payload size under maxUDPPayload, even in the worst case
+	// keep the UDP payload size under downloadMaxMTU, even in the worst case
 	// of a maximum-length name in the query's Question section.
 	var maxEncodedPayload int
+	
+	// HELPER: Find the minimum capacity across all configured domains
+	getMinNameBasedCapacity := func(domainList []dns.Name) int {
+		minCap := 999999
+		for _, d := range domainList {
+			cap := computeMaxEncodedPayloadNameBased(d)
+			if cap < minCap {
+				minCap = cap
+			}
+		}
+		return minCap
+	}
+		
 	switch recordType {
 	case dns.RRTypeCNAME, dns.RRTypeNS, dns.RRTypeMX, dns.RRTypeSRV:
-		maxEncodedPayload = computeMaxEncodedPayloadNameBased(domain)
+		maxEncodedPayload = getMinNameBasedCapacity(domains) //  Use Helper
 	case dns.RRTypeA:
-		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 4)
+		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(downloadMaxMTU, 4)
 	case dns.RRTypeAAAA:
-		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(maxUDPPayload, 16)
+		maxEncodedPayload = computeMaxEncodedPayloadMultiRR(downloadMaxMTU, 16)
 	case dns.RRTypeNULL:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataNULL)
+		maxEncodedPayload = computeMaxEncodedPayload(downloadMaxMTU, dns.EncodeRDataNULL)
 	case dns.RRTypeCAA:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataCAA)
+		maxEncodedPayload = computeMaxEncodedPayload(downloadMaxMTU, dns.EncodeRDataCAA)
 	default:
-		maxEncodedPayload = computeMaxEncodedPayload(maxUDPPayload, dns.EncodeRDataTXT)
+		maxEncodedPayload = computeMaxEncodedPayload(downloadMaxMTU, dns.EncodeRDataTXT)
 	}
 	// 2 bytes accounts for a packet length prefix.
 	mtu := maxEncodedPayload - 2
@@ -1158,7 +1217,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		if mtu < 0 {
 			mtu = 0
 		}
-		return fmt.Errorf("maximum UDP payload size of %d leaves only %d bytes for payload", maxUDPPayload, mtu)
+		return fmt.Errorf("maximum UDP payload size of %d leaves only %d bytes for payload", downloadMaxMTU, mtu)
 	}
 	log.Infof("effective MTU %d", mtu)
 
@@ -1198,13 +1257,14 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
 	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, domain)
+		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
 		if err != nil {
 			log.Warnf("sendLoop: %v", err)
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+	return recvLoop(domains, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+
 }
 
 var version = "dev"
@@ -1242,7 +1302,13 @@ Example:
 		flag.PrintDefaults()
 	}
 	flag.BoolVar(&genKey, "gen-key", false, "generate a server keypair; print to stdout or save to files")
-	flag.IntVar(&maxUDPPayload, "mtu", maxUDPPayload, "maximum size of DNS responses")
+	
+	// Replaced old -mtu with separated MTU flags for symmetry with client
+	flag.IntVar(&uploadMinMTU, "upload-min-mtu", 40, "minimum upload MTU (for client parity)")
+	flag.IntVar(&uploadMaxMTU, "upload-max-mtu", 140, "maximum upload MTU (for client parity)")
+	flag.IntVar(&downloadMinMTU, "download-min-mtu", 200, "minimum download MTU (for client parity)")
+	flag.IntVar(&downloadMaxMTU, "download-max-mtu", downloadMaxMTU, "maximum size of DNS responses")
+	
 	flag.StringVar(&privkeyString, "privkey", "", fmt.Sprintf("server private key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
@@ -1314,12 +1380,27 @@ Example:
 			fmt.Fprintf(os.Stderr, "the -upstream option is required\n")
 			os.Exit(1)
 		}
-		domain, err := dns.ParseName(domainArg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", domainArg, err)
+
+		var domains []dns.Name
+		for _, dStr := range strings.Split(domainArg, ",") {
+			dStr = strings.TrimSpace(dStr)
+			if dStr == "" {
+				continue
+			}
+			d, err := dns.ParseName(dStr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", dStr, err)
+				os.Exit(1)
+			}
+			domains = append(domains, d)
+		}
+		if len(domains) == 0 {
+			fmt.Fprintf(os.Stderr, "no valid domains provided\n")
 			os.Exit(1)
 		}
-		log.Infof("serving domain: %s", domain)
+
+		log.Infof("serving domains: %v", domains) // Log all active domains
+		
 		// We keep upstream as a string in order to eventually pass it
 		// to net.Dial in handleStream. But for the sake of displaying
 		// an error or warning at startup, rather than only when the
@@ -1481,12 +1562,12 @@ Example:
 			flag.Visit(func(f *flag.Flag) {
 				explicitFlags[f.Name] = true
 			})
-			if explicitFlags["mtu"] {
-				log.Warnf("-mtu has no effect with -record-type %s; capacity is bounded by the DNS name length limit (255 bytes)", recordTypeStr)
+			if explicitFlags["download-max-mtu"] {
+				log.Warnf("-download-max-mtu has no effect with -record-type %s; capacity is bounded by the DNS name length limit (255 bytes)", recordTypeStr)
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive, queueSize, kcpWindowSize, queueOverflowMode, wireConfig)
+		err = run(privkey, domains, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive, queueSize, kcpWindowSize, queueOverflowMode, wireConfig)
 		if err != nil {
 			log.Fatalf("%v", err)
 		}

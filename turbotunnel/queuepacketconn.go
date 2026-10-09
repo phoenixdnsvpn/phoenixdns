@@ -2,6 +2,7 @@ package turbotunnel
 
 import (
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,12 +34,14 @@ type taggedPacket struct {
 // packet has been stashed, it must be checked for by calling Unstash in
 // addition to OutgoingQueue.
 type QueuePacketConn struct {
-	remotes      *RemoteMap
-	localAddr    net.Addr
-	recvQueue    chan taggedPacket
-	overflowMode QueueOverflowMode
-	closeOnce    sync.Once
-	closed       chan struct{}
+	remotes        *RemoteMap
+	localAddr      net.Addr
+	recvQueue      chan taggedPacket
+	overflowMode   QueueOverflowMode
+	closeOnce      sync.Once
+	closed         chan struct{}
+	readDeadlineMu sync.RWMutex
+	readDeadline   time.Time
 	// What error to return when the QueuePacketConn is closed.
 	err atomic.Value
 }
@@ -116,6 +119,29 @@ func (c *QueuePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return 0, nil, &net.OpError{Op: "read", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
 	default:
 	}
+
+	c.readDeadlineMu.RLock()
+	deadline := c.readDeadline
+	c.readDeadlineMu.RUnlock()
+
+	if !deadline.IsZero() {
+		now := time.Now()
+		if !now.Before(deadline) {
+			return 0, nil, &net.OpError{Op: "read", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: os.ErrDeadlineExceeded}
+		}
+		timer := time.NewTimer(deadline.Sub(now))
+		defer timer.Stop()
+
+		select {
+		case <-c.closed:
+			return 0, nil, &net.OpError{Op: "read", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
+		case <-timer.C:
+			return 0, nil, &net.OpError{Op: "read", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: os.ErrDeadlineExceeded}
+		case packet := <-c.recvQueue:
+			return copy(p, packet.P), packet.Addr, nil
+		}
+	}
+
 	select {
 	case <-c.closed:
 		return 0, nil, &net.OpError{Op: "read", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
@@ -223,6 +249,23 @@ func (c *QueuePacketConn) Closed() <-chan struct{} { return c.closed }
 // LocalAddr returns the localAddr value that was passed to NewQueuePacketConn.
 func (c *QueuePacketConn) LocalAddr() net.Addr { return c.localAddr }
 
-func (c *QueuePacketConn) SetDeadline(t time.Time) error      { return errNotImplemented }
-func (c *QueuePacketConn) SetReadDeadline(t time.Time) error  { return errNotImplemented }
-func (c *QueuePacketConn) SetWriteDeadline(t time.Time) error { return errNotImplemented }
+func (c *QueuePacketConn) SetDeadline(t time.Time) error {
+	_ = c.SetWriteDeadline(t)
+	return c.SetReadDeadline(t)
+}
+
+func (c *QueuePacketConn) SetReadDeadline(t time.Time) error {
+	select {
+	case <-c.closed:
+		return &net.OpError{Op: "set", Net: c.LocalAddr().Network(), Addr: c.LocalAddr(), Err: c.err.Load().(error)}
+	default:
+	}
+	c.readDeadlineMu.Lock()
+	c.readDeadline = t
+	c.readDeadlineMu.Unlock()
+	return nil
+}
+
+func (c *QueuePacketConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}

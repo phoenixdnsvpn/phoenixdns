@@ -61,7 +61,15 @@ func main() {
 	var queueSize int
 	var kcpWindowSize int
 	var queueOverflowStr string
-
+	var uploadMinMTU int
+	var uploadMaxMTU int
+	var downloadMinMTU int
+	var downloadMaxMTU int
+	
+	// --- NEW FLAGS ---
+	var disableDynamicMTU bool
+	var fixedMTU int
+	
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR
@@ -120,7 +128,7 @@ Known TLS fingerprints for -utls are:
 		"choose TLS fingerprint from weighted distribution")
 	flag.StringVar(&domainArg, "domain", "", "tunnel domain (e.g., t.example.com)")
 	flag.StringVar(&listenAddr, "listen", "", "TCP address to listen on for local connections (e.g., 127.0.0.1:7000)")
-	flag.IntVar(&maxQnameLen, "max-qname-len", 101, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
+	flag.IntVar(&maxQnameLen, "max-qname-len", 253, "maximum total QNAME length in wire format (0 = 253 per RFC 1035)")
 	flag.IntVar(&maxNumLabels, "max-num-labels", 0, "maximum number of data labels in query name (0 = unlimited)")
 	flag.Float64Var(&rpsLimit, "rps", 0, "limit outgoing DNS queries per second (0 = unlimited)")
 	flag.StringVar(&idleTimeoutStr, "idle-timeout", client.DefaultIdleTimeout.String(), "session idle timeout (e.g. 10s, 1m); reconnects if no data received within this period")
@@ -140,6 +148,14 @@ Known TLS fingerprints for -utls are:
 	flag.IntVar(&queueSize, "queue-size", turbotunnel.QueueSize, "packet queue size for transport and DNS layers")
 	flag.IntVar(&kcpWindowSize, "kcp-window-size", 0, "KCP send/receive window size in packets (0 = queue-size/2)")
 	flag.StringVar(&queueOverflowStr, "queue-overflow", string(turbotunnel.DefaultQueueOverflowMode), "queue overflow behavior: drop or block")
+	flag.IntVar(&uploadMinMTU, "upload-min-mtu", 40, "minimum upload MTU to probe")
+	flag.IntVar(&uploadMaxMTU, "upload-max-mtu", 140, "maximum upload MTU to probe")
+	flag.IntVar(&downloadMinMTU, "download-min-mtu", 200, "minimum download MTU to probe")
+	flag.IntVar(&downloadMaxMTU, "download-max-mtu", 1232, "maximum download MTU to probe")
+	
+	// --- NEW FLAGS MAP ---
+	flag.BoolVar(&disableDynamicMTU, "disable-mtu-discovery", false, "disable dynamic MTU discovery and use static calculation")
+	flag.IntVar(&fixedMTU, "mtu", 0, "force a specific upload MTU (requires -disable-mtu-discovery)")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warning, error)")
@@ -321,6 +337,19 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 
+	if uploadMinMTU <= 0 || uploadMaxMTU <= 0 || downloadMinMTU <= 0 || downloadMaxMTU <= 0 {
+		fmt.Fprintf(os.Stderr, "MTU values must be positive\n")
+		os.Exit(1)
+	}
+	if uploadMinMTU > uploadMaxMTU {
+		fmt.Fprintf(os.Stderr, "-upload-min-mtu (%d) cannot be greater than -upload-max-mtu (%d)\n", uploadMinMTU, uploadMaxMTU)
+		os.Exit(1)
+	}
+	if downloadMinMTU > downloadMaxMTU {
+		fmt.Fprintf(os.Stderr, "-download-min-mtu (%d) cannot be greater than -download-max-mtu (%d)\n", downloadMinMTU, downloadMaxMTU)
+		os.Exit(1)
+	}
+	
 	// Apply -dnstt-compat overrides.
 	if compatDnstt {
 		if recordTypeStr != "txt" {
@@ -378,7 +407,15 @@ Known TLS fingerprints for -utls are:
 	ts.MaxNumLabels = maxNumLabels
 	ts.RPS = rpsLimit
 	ts.RecordType = recordTypeStr
-
+	ts.UploadMinMTU = uploadMinMTU
+	ts.UploadMaxMTU = uploadMaxMTU
+	ts.DownloadMinMTU = downloadMinMTU
+	ts.DownloadMaxMTU = downloadMaxMTU
+	
+	// --- MAP NEW FLAGS ---
+	ts.DisableDynamicMTU = disableDynamicMTU
+	ts.MTU = fixedMTU
+	
 	// Build tunnel.
 	tunnel, err := client.NewTunnel(resolver, ts)
 	if err != nil {

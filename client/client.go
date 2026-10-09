@@ -19,8 +19,10 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -132,6 +134,13 @@ type TunnelServer struct {
 	// RecordType selects the DNS record type for downstream data.
 	// Supported values: "txt" (default), "cname", "a", "aaaa", "mx", "ns", "srv".
 	RecordType string
+	
+	UploadMinMTU   int
+	UploadMaxMTU   int
+	DownloadMinMTU int
+	DownloadMaxMTU int
+	
+	DisableDynamicMTU bool		
 }
 
 // NewTunnelServer creates a TunnelServer from a domain string and hex-encoded
@@ -180,10 +189,11 @@ func (ts *TunnelServer) effectiveMaxQnameLen() int {
 	if ts.MaxQnameLen > 0 {
 		return ts.MaxQnameLen
 	}
-	if ts.DnsttCompat {
-		return 253
-	}
-	return 101
+//	if ts.DnsttCompat {
+//		return 253
+//	}
+//	return 101
+	return 253
 }
 
 // Tunnel represents a DNS tunnel connection. Create with NewTunnel, then
@@ -380,18 +390,141 @@ func (t *Tunnel) InitiateDNSPacketConn(domain dns.Name) error {
 	return nil
 }
 
+// DiscoverMTU actively probes the network path to find the maximum fragmentation limit.
+func (t *Tunnel) DiscoverMTU() (int, error) {
+	// Base limits: calculate mathematical maximums for the domain[cite: 6]
+	mathUploadCeiling := DNSNameCapacity(t.TunnelServer.Addr, t.TunnelServer.effectiveMaxQnameLen(), t.TunnelServer.MaxNumLabels) - t.wireConfig.DataOverhead()
+	mathDownloadCeiling := 1232 // Standard safe EDNS0 limit
+
+	// Apply user-defined constraints, capped by mathematical reality
+	upMax := t.TunnelServer.UploadMaxMTU
+	if upMax > mathUploadCeiling {
+		upMax = mathUploadCeiling
+	}
+	upMin := t.TunnelServer.UploadMinMTU
+	if upMin > upMax {
+		upMin = upMax
+	}
+
+	downMax := t.TunnelServer.DownloadMaxMTU
+	if downMax > mathDownloadCeiling {
+		downMax = mathDownloadCeiling
+	}
+	downMin := t.TunnelServer.DownloadMinMTU
+	if downMin > downMax {
+		downMin = downMax
+	}
+
+	var codeCounter uint32 = 0
+	magic := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+
+	probe := func(reqType byte, targetSize int, reqSize int) bool {
+		codeCounter++
+		code := make([]byte, 4)
+		binary.BigEndian.PutUint32(code, codeCounter)
+
+		req := make([]byte, targetSize)
+		copy(req[0:4], magic)
+		req[4] = reqType
+		copy(req[5:9], code)
+		if reqType == 0x03 { // ProbeDownReq
+			binary.BigEndian.PutUint16(req[9:11], uint16(reqSize))
+		}
+
+		// Write raw probe directly over DNSPacketConn (bypassing KCP)[cite: 5]
+		_, err := t.dnsPacketConn.WriteTo(req, t.remoteAddr)
+		if err != nil {
+			return false
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+		buf := make([]byte, 4096)
+		for {
+			if time.Now().After(deadline) {
+				return false
+			}
+			t.dnsPacketConn.SetReadDeadline(deadline)
+			n, _, err := t.dnsPacketConn.ReadFrom(buf)
+			if err != nil {
+				return false // Dropped or timed out
+			}
+
+			p := buf[:n]
+			// Verify cryptographic echo to ensure no silent truncation
+			if len(p) >= 9 && bytes.HasPrefix(p, magic) && bytes.Equal(p[5:9], code) {
+				if reqType == 0x01 && p[4] == 0x02 && len(p) >= 11 {
+					return int(binary.BigEndian.Uint16(p[9:11])) == targetSize
+				}
+				if reqType == 0x03 && p[4] == 0x04 {
+					return len(p) == reqSize
+				}
+			}
+		}
+	}
+
+	binarySearch := func(reqType byte, low, high int) int {
+		best := -1 // Fails cleanly if 0 probes succeed
+		for low <= high {
+			mid := (low + high) / 2
+			success := false
+			for attempt := 0; attempt < 3; attempt++ {
+				tSize, rSize := mid, mid
+				if reqType == 0x03 {
+					tSize = 25
+				}
+				if probe(reqType, tSize, rSize) {
+					success = true
+					break
+				}
+			}
+			if success {
+				best = mid
+				low = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		return best
+	}
+
+	log.Infof("Probing dynamic Upload MTU (Range: %d-%d)...", upMin, upMax)
+	up := binarySearch(0x01, upMin, upMax)
+	if up < upMin {
+		return 0, fmt.Errorf("upload MTU (%d) failed to meet minimum requirement (%d)", up, upMin)
+	}
+
+	log.Infof("Probing dynamic Download MTU (Range: %d-%d)...", downMin, downMax)
+	down := binarySearch(0x03, downMin, downMax)
+	if down < downMin {
+		log.Warnf("Network download MTU (%d) is below requested minimum (%d)", down, downMin)
+	}
+
+	log.Infof("Discovered Asymmetric MTU - Upload: %d, Download: %d", up, down)
+	
+	// Reset deadline for normal KCP operation
+	t.dnsPacketConn.SetReadDeadline(time.Time{})
+	
+	// ONLY return the Upload MTU for the client to use. 
+	// The client's KCP session only dictates OUTGOING frame sizes. 
+	// The server will handle large download frames based on its own config.
+	return up, nil 
+}
+
 // InitiateKCPConn opens a KCP connection over the DNS packet connection.
-// If mtu is 0, it is auto-computed from the domain and QNAME constraints.
+// If mtu is 0, it is dynamically discovered via the network path.
 func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	if mtu <= 0 {
-		maxQnameLen := t.TunnelServer.effectiveMaxQnameLen()
-		mtu = DNSNameCapacity(t.TunnelServer.Addr, maxQnameLen, t.TunnelServer.MaxNumLabels) - t.wireConfig.DataOverhead()
+		var err error
+		mtu, err = t.DiscoverMTU()
+		if err != nil {
+			return fmt.Errorf("MTU discovery failed: %v", err)
+		}
+		t.TunnelServer.MTU = mtu
 	}
 	if mtu < 25 {
 		return fmt.Errorf("MTU %d is too small (minimum 25); try increasing -max-qname-len (currently %d), increasing -max-num-labels (currently %d), using a shorter domain, or decreasing -clientid-size (currently %d)",
 			mtu, t.TunnelServer.effectiveMaxQnameLen(), t.TunnelServer.MaxNumLabels, t.wireConfig.ClientIDSize)
 	}
-	t.TunnelServer.MTU = mtu
 	log.Infof("effective MTU %d", mtu)
 
 	conn, err := kcp.NewConn2(t.remoteAddr, nil, 0, 0, t.dnsPacketConn)
@@ -614,14 +747,6 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 		return fmt.Errorf("invalid listen address: %v", err)
 	}
 
-	maxQnameLen := t.TunnelServer.effectiveMaxQnameLen()
-	mtu := DNSNameCapacity(t.TunnelServer.Addr, maxQnameLen, t.TunnelServer.MaxNumLabels) - t.wireConfig.DataOverhead()
-	if mtu < 25 {
-		return fmt.Errorf("MTU %d is too small (minimum 25); try increasing -max-qname-len (currently %d), increasing -max-num-labels (currently %d), using a shorter domain, or decreasing -clientid-size (currently %d)",
-			mtu, maxQnameLen, t.TunnelServer.MaxNumLabels, t.wireConfig.ClientIDSize)
-	}
-	log.Infof("effective MTU %d", mtu)
-
 	ln, err := net.ListenTCP("tcp", localAddr)
 	if err != nil {
 		return fmt.Errorf("opening local listener: %v", err)
@@ -657,7 +782,19 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 		var sess *smux.Session
 		delay = t.ReconnectMinDelay
 		for {
-			conn, sess, err = t.createSession(mtu)
+			// Bypass MTU discovery if requested
+			mtuToUse := 0
+			if t.TunnelServer.DisableDynamicMTU {
+				maxQnameLen := t.TunnelServer.effectiveMaxQnameLen()
+				capacity := DNSNameCapacity(t.TunnelServer.Addr, maxQnameLen, t.TunnelServer.MaxNumLabels) - t.wireConfig.DataOverhead()
+				mtuToUse = capacity
+				if t.TunnelServer.MTU > 0 {
+					mtuToUse = t.TunnelServer.MTU // Override if explicitly requested by CLI
+				}
+				log.Infof("MTU discovery bypassed. Using fixed MTU: %d", mtuToUse)
+			}
+					
+			conn, sess, err = t.createSession(0)
 			if err == nil {
 				break
 			}
@@ -729,6 +866,15 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 
 // createSession creates a KCP+Noise+smux session (used by ListenAndServe).
 func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *smux.Session, error) {
+	if mtu <= 0 {
+		var err error
+		mtu, err = t.DiscoverMTU()
+		if err != nil {
+			return nil, nil, fmt.Errorf("MTU discovery failed: %v", err)
+		}
+		t.TunnelServer.MTU = mtu
+	}
+
 	conn, err := kcp.NewConn2(t.remoteAddr, nil, 0, 0, t.dnsPacketConn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening KCP conn: %v", err)
