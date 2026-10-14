@@ -35,6 +35,7 @@ func main() {
 	var showVersion bool
 	var dohURL string
 	var dotAddr string
+	var tcpAddr string
 	var domainArg string
 	var listenAddr string
 	var pubkeyFilename string
@@ -72,11 +73,12 @@ func main() {
 	
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR
+  %[1]s [-doh URL|-dot ADDR|-tcp ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR  
 
 Examples:
   %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
   %[1]s -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+  %[1]s -tcp resolver.example:53 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000  
 
 `, os.Args[0])
 		flag.CommandLine.VisitAll(func(f *flag.Flag) {
@@ -120,6 +122,7 @@ Known TLS fingerprints for -utls are:
 	}
 	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
 	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
+	flag.StringVar(&tcpAddr, "tcp", "", "address of TCP DNS resolver")	
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
 	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver")
@@ -241,6 +244,11 @@ Known TLS fingerprints for -utls are:
 		resolverAddr = dotAddr
 		transportCount++
 	}
+	if tcpAddr != "" {
+		resolverType = client.ResolverTypeTCP
+		resolverAddr = tcpAddr
+		transportCount++
+	}	
 	if udpAddr != "" {
 		resolverType = client.ResolverTypeUDP
 		resolverAddr = udpAddr

@@ -66,6 +66,7 @@ type ResolverType string
 
 const (
 	ResolverTypeUDP ResolverType = "udp"
+	ResolverTypeTCP ResolverType = "tcp"	
 	ResolverTypeDOT ResolverType = "dot"
 	ResolverTypeDOH ResolverType = "doh"
 )
@@ -97,7 +98,7 @@ type Resolver struct {
 // NewResolver creates a Resolver with the given type and address.
 func NewResolver(resolverType ResolverType, resolverAddr string) (Resolver, error) {
 	switch resolverType {
-	case ResolverTypeUDP, ResolverTypeDOT, ResolverTypeDOH:
+	case ResolverTypeUDP, ResolverTypeTCP, ResolverTypeDOT, ResolverTypeDOH:
 	default:
 		return Resolver{}, fmt.Errorf("unsupported resolver type: %s", resolverType)
 	}
@@ -335,7 +336,19 @@ func (t *Tunnel) InitiateResolverConnection() error {
 			t.resolverConn = conn
 		}
 		return nil
-
+	case ResolverTypeTCP:
+		t.remoteAddr = turbotunnel.DummyAddr{}
+		dialTCPContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, addr)
+		}
+		// Reuse TLSPacketConn as DNS-over-TCP shares the exact 2-byte framing as DoT
+		conn, err := NewTLSPacketConn(r.ResolverAddr, dialTCPContext, t.effectivePacketQueueSize(), t.effectiveQueueOverflowMode())
+		if err != nil {
+			return err
+		}
+		t.resolverConn = conn
+		return nil
 	case ResolverTypeDOH:
 		t.remoteAddr = turbotunnel.DummyAddr{}
 		var rt http.RoundTripper
@@ -533,7 +546,13 @@ func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	}
 	log.Infof("session %08x ready", conn.GetConv())
 	conn.SetStreamMode(true)
-	conn.SetNoDelay(0, 0, 0, 1)
+	if t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeTCP {
+		// nodelay=1, interval=200ms, resend=2, nc=1
+		conn.SetNoDelay(1, 200, 2, 1)
+	} else {
+		conn.SetNoDelay(0, 0, 0, 1)
+	}	
+
 	conn.SetWindowSize(t.effectiveKCPWindowSize(), t.effectiveKCPWindowSize())
 	if rc := conn.SetMtu(mtu); !rc {
 		conn.Close()
@@ -881,7 +900,13 @@ func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *smux.Session, error) 
 	}
 	log.Infof("session %08x ready", conn.GetConv())
 	conn.SetStreamMode(true)
-	conn.SetNoDelay(0, 0, 0, 1)
+	
+	if t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeTCP {
+		conn.SetNoDelay(1, 200, 2, 1)
+	} else {
+		conn.SetNoDelay(0, 0, 0, 1)
+	}
+	
 	conn.SetWindowSize(t.effectiveKCPWindowSize(), t.effectiveKCPWindowSize())
 	if rc := conn.SetMtu(mtu); !rc {
 		conn.Close()
