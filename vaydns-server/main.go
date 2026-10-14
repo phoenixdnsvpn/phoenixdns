@@ -413,9 +413,11 @@ func nextPacketDnstt(r *bytes.Reader) ([]byte, error) {
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte, dns.Name) {
+func responseFor(query *dns.Message, domains []dns.Name, isTCP bool) (*dns.Message, []byte, dns.Name) {
 	responsePayloadSize := uint16(downloadMaxMTU)
-	if int(responsePayloadSize) != downloadMaxMTU {
+	if isTCP {
+		responsePayloadSize = 0xffff // Max capacity for TCP
+	} else if int(responsePayloadSize) != downloadMaxMTU {
 		responsePayloadSize = 0xffff
 	}
 
@@ -548,7 +550,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte, 
 	// problem with processing the OPT record itself, such as an option
 	// value that is badly formatted or that includes out-of-range values, a
 	// FORMERR MUST be returned."
-	if payloadSize < downloadMaxMTU {
+	if !isTCP && payloadSize < downloadMaxMTU {
 		resp.Flags |= dns.RcodeFormatError
 		log.Debugf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, downloadMaxMTU)
 		return resp, nil, nil
@@ -559,7 +561,7 @@ func responseFor(query *dns.Message, domains []dns.Name) (*dns.Message, []byte, 
 
 // record represents a DNS message appropriate for a response to a previously
 // received query, along with metadata necessary for sending the response.
-// recvLoop sends instances of record to sendLoop via a channel. sendLoop
+// udpRecvLoop sends instances of record to sendLoop via a channel. sendLoop
 // receives instances of record and may fill in the message's Answer section
 // before sending it.
 type record struct {
@@ -567,6 +569,8 @@ type record struct {
 	Addr     net.Addr
 	ClientID turbotunnel.ClientID
 	Domain   dns.Name
+	SendFunc func([]byte) error
+	IsTCP    bool	
 }
 
 // --- Fallback NAT logic for non-DNS packets ---
@@ -696,12 +700,76 @@ func (m *FallbackManager) forwardReplies(proxyConn net.PacketConn, clientAddr ne
 	}
 }
 
-// recvLoop repeatedly calls dnsConn.ReadFrom, extracts the packets contained in
+func processParsedQuery(query *dns.Message, domains []dns.Name, wireConfig turbotunnel.WireConfig, ttConn *turbotunnel.QueuePacketConn, isTCP bool) (*dns.Message, turbotunnel.ClientID, dns.Name) {
+	resp, payload, matchedDomain := responseFor(query, domains, isTCP)
+	var clientID turbotunnel.ClientID
+	if len(payload) < wireConfig.ClientIDSize {
+		if resp != nil && resp.Rcode() == dns.RcodeNoError {
+			resp.Flags |= dns.RcodeNameError
+			log.Debugf("NXDOMAIN: %d bytes are too short to contain a ClientID", len(payload))
+		}
+	} else {
+		clientID = turbotunnel.ClientID(string(payload[:wireConfig.ClientIDSize]))
+		payload = payload[wireConfig.ClientIDSize:]
+		r := bytes.NewReader(payload)
+		for {
+			var p []byte
+			var err error
+			if wireConfig.IsDnstt() {
+				p, err = nextPacketDnstt(r)
+			} else {
+				p, err = nextPacket(r)
+			}
+			if err != nil {
+				break
+			}
+
+			// --- START DYNAMIC MTU INTERCEPTOR ---
+			if len(p) >= 9 && bytes.HasPrefix(p, []byte{0xFF, 0xFF, 0xFF, 0xFF}) {
+				probeType := p[4]
+				code := p[5:9]
+
+				var respProbe []byte
+				if probeType == 0x01 { // ProbeUpReq
+					respProbe = make([]byte, 11)
+					copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+					respProbe[4] = 0x02 // ProbeUpRes
+					copy(respProbe[5:9], code)
+					binary.BigEndian.PutUint16(respProbe[9:11], uint16(len(p)))
+				} else if probeType == 0x03 { // ProbeDownReq
+					if len(p) >= 11 {
+						reqSize := int(binary.BigEndian.Uint16(p[9:11]))
+						if !isTCP && reqSize > downloadMaxMTU {
+							reqSize = downloadMaxMTU // UDP limit
+						} else if isTCP && reqSize > 65535 {
+							reqSize = 65535 // TCP limit
+						}
+						respProbe = make([]byte, reqSize)
+						copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
+						respProbe[4] = 0x04 // ProbeDownRes
+						copy(respProbe[5:9], code)
+					}
+				}
+
+				if respProbe != nil {
+					ttConn.WriteTo(respProbe, clientID)
+				}
+				continue 
+			}
+			// --- END DYNAMIC MTU INTERCEPTOR ---
+
+			ttConn.QueueIncoming(p, clientID)
+		}
+	}
+	return resp, clientID, matchedDomain
+}
+
+// udpRecvLoop repeatedly calls dnsConn.ReadFrom, extracts the packets contained in
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch. Invalid DNS packets are passed to the FallbackManager.
 
-func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
+func udpRecvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, fallbackMgr *FallbackManager, stats *ServerStats, wireConfig turbotunnel.WireConfig) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -715,11 +783,9 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 
 		stats.incTotal()
 
-		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
 			if fallbackMgr != nil {
-				// Packet is not a valid DNS message, forward it if fallback is configured.
 				fallbackMgr.HandlePacket(buf[:n], addr)
 			} else {
 				log.Debugf("cannot parse DNS query from %s: %v", addr, err)
@@ -727,78 +793,82 @@ func recvLoop(domains []dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Qu
 			continue
 		}
 
-		resp, payload, matchedDomain := responseFor(&query, domains)
-		// Extract the ClientID from the payload.
-		var clientID turbotunnel.ClientID
-		if len(payload) < wireConfig.ClientIDSize {
-			// Payload is not long enough to contain a ClientID.
-			if resp != nil && resp.Rcode() == dns.RcodeNoError {
-				resp.Flags |= dns.RcodeNameError
-				log.Debugf("NXDOMAIN: %d bytes are too short to contain a ClientID", len(payload))
-			}
-		} else {
-			clientID = turbotunnel.ClientID(string(payload[:wireConfig.ClientIDSize]))
-			payload = payload[wireConfig.ClientIDSize:]
-			// Pull out the packets contained in the payload.
-			r := bytes.NewReader(payload)
-			for {
-				var p []byte
-				var err error
-				if wireConfig.IsDnstt() {
-					p, err = nextPacketDnstt(r)
-				} else {
-					p, err = nextPacket(r)
-				}
-				if err != nil {
-					break
-				}
+		resp, clientID, matchedDomain := processParsedQuery(&query, domains, wireConfig, ttConn, false)
 
-				// --- START DYNAMIC MTU INTERCEPTOR ---
-				// Magic Header: 0xFF 0xFF 0xFF 0xFF
-				if len(p) >= 9 && bytes.HasPrefix(p, []byte{0xFF, 0xFF, 0xFF, 0xFF}) {
-					probeType := p[4]
-					code := p[5:9]
-
-					var respProbe []byte
-					if probeType == 0x01 { // ProbeUpReq
-						respProbe = make([]byte, 11)
-						copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
-						respProbe[4] = 0x02 // ProbeUpRes
-						copy(respProbe[5:9], code)
-						binary.BigEndian.PutUint16(respProbe[9:11], uint16(len(p)))
-					} else if probeType == 0x03 { // ProbeDownReq
-						if len(p) >= 11 {
-							reqSize := int(binary.BigEndian.Uint16(p[9:11]))
-							if reqSize > downloadMaxMTU {
-								reqSize = downloadMaxMTU // Sanity bound
-							}
-							respProbe = make([]byte, reqSize)
-							copy(respProbe[0:4], []byte{0xFF, 0xFF, 0xFF, 0xFF})
-							respProbe[4] = 0x04 // ProbeDownRes
-							copy(respProbe[5:9], code)
-						}
-					}
-
-					if respProbe != nil {
-						// Write directly back to the turbotunnel outgoing queue, bypassing KCP
-						ttConn.WriteTo(respProbe, clientID)
-					}
-					continue // Skip feeding this probe to KCP
-				}
-				// --- END DYNAMIC MTU INTERCEPTOR ---
-
-				// Feed the incoming packet to KCP.
-				ttConn.QueueIncoming(p, clientID)
-			}
-		}
-		// If a response is called for, pass it to sendLoop via the channel.
 		if resp != nil {
 			if resp.Rcode() == dns.RcodeNoError {
 				stats.incSuccess()
 			}
+			
+			// UDP Send Callback
+			sendFunc := func(b []byte) error {
+				_, err := dnsConn.WriteTo(b, addr)
+				return err
+			}
+			
 			select {
-			//case ch <- &record{resp, addr, clientID}:
-			case ch <- &record{resp, addr, clientID, matchedDomain}:
+			case ch <- &record{resp, addr, clientID, matchedDomain, sendFunc, false}:
+			default:
+			}
+		}
+	}
+}
+
+func tcpAcceptLoop(domains []dns.Name, ln net.Listener, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, stats *ServerStats, wireConfig turbotunnel.WireConfig) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Warnf("TCP accept error: %v", err)
+			continue
+		}
+		go tcpRecvLoop(domains, conn, ttConn, ch, stats, wireConfig)
+	}
+}
+
+func tcpRecvLoop(domains []dns.Name, conn net.Conn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, stats *ServerStats, wireConfig turbotunnel.WireConfig) {
+	defer conn.Close()
+	for {
+		// Read the 2-byte length prefix
+		var length uint16
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+				log.Debugf("TCP read length error: %v", err)
+			}
+			return
+		}
+		
+		// Read the exact payload
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			log.Debugf("TCP read payload error: %v", err)
+			return
+		}
+
+		stats.incTotal()
+
+		query, err := dns.MessageFromWireFormat(buf)
+		if err != nil {
+			log.Debugf("cannot parse TCP DNS query from %s: %v", conn.RemoteAddr(), err)
+			continue // Keep connection open for next query
+		}
+
+		resp, clientID, matchedDomain := processParsedQuery(&query, domains, wireConfig, ttConn, true)
+
+		if resp != nil {
+			if resp.Rcode() == dns.RcodeNoError {
+				stats.incSuccess()
+			}
+			
+			// TCP Send Callback (Adds 2-byte length prefix)
+			sendFunc := func(b []byte) error {
+				lenBuf := make([]byte, 2)
+				binary.BigEndian.PutUint16(lenBuf, uint16(len(b)))
+				_, err := conn.Write(append(lenBuf, b...))
+				return err
+			}
+
+			select {
+			case ch <- &record{resp, conn.RemoteAddr(), clientID, matchedDomain, sendFunc, true}:
 			default:
 			}
 		}
@@ -865,7 +935,7 @@ func encodeResponsePayload(rec *record, data []byte, domain dns.Name) error {
 // response, it sends on the network immediately. Those that represent a
 // response capable of carrying data, it packs full of as many packets as will
 // fit while keeping the total size under maxEncodedPayload, then sends it.
-func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) error {
+func sendLoop(ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int) error {
 	var nextRec *record
 	for {
 		rec := nextRec
@@ -897,6 +967,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 			var payload bytes.Buffer
 			limit := maxEncodedPayload
+			if rec.IsTCP {
+				limit = 65000 // Massive batching limit for TCP!
+			}			
 			// We loop and bundle as many packets from OutgoingQueue
 			// into the response as will fit. Any packet that would
 			// overflow the capacity of the DNS response, we stash
@@ -973,22 +1046,23 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
-		if len(buf) > downloadMaxMTU {
-			log.Warnf("truncating response of %d bytes to max of %d", len(buf), downloadMaxMTU)
+		// Truncate only if it's UDP and exceeds standard MTU
+		if !rec.IsTCP && len(buf) > downloadMaxMTU {
+			log.Warnf("truncating UDP response of %d bytes to max of %d", len(buf), downloadMaxMTU)
 			buf = buf[:downloadMaxMTU]
 			buf[2] |= 0x02 // TC = 1
 		}
 
-		// Now we actually send the message as a UDP packet.
-		_, err = dnsConn.WriteTo(buf, rec.Addr)
+		// Abstract send (UDP writes to addr, TCP adds prefix and streams)
+		err = rec.SendFunc(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return err
 			}
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Warnf("WriteTo temporary error: %v", err)
+				log.Warnf("SendFunc temporary error: %v", err)
 			} else {
-				log.Warnf("WriteTo error: %v", err)
+				log.Warnf("SendFunc error: %v", err)
 			}
 			continue
 		}
@@ -1171,7 +1245,7 @@ func computeMaxEncodedPayloadMultiRR(limit int, chunkSize int) int {
 	return low
 }
 
-func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration, queueSize int, kcpWindowSize int, queueOverflowMode turbotunnel.QueueOverflowMode, wireConfig turbotunnel.WireConfig) error {
+func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.PacketConn, tcpListener net.Listener, fallbackAddr *net.UDPAddr, idleTimeout time.Duration, keepAlive time.Duration, queueSize int, kcpWindowSize int, queueOverflowMode turbotunnel.QueueOverflowMode, wireConfig turbotunnel.WireConfig) error {
 	defer dnsConn.Close()
 
 	log.Infof("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -1257,13 +1331,16 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
 	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
+		err := sendLoop(ttConn, ch, maxEncodedPayload)
 		if err != nil {
 			log.Warnf("sendLoop: %v", err)
 		}
 	}()
 
-	return recvLoop(domains, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+	// Start concurrent TCP listener
+	go tcpAcceptLoop(domains, tcpListener, ttConn, ch, stats, wireConfig)
+
+	return udpRecvLoop(domains, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
 
 }
 
@@ -1440,6 +1517,13 @@ Example:
 			os.Exit(1)
 		}
 
+		// Start TCP listener on the exact same port
+		tcpListener, err := net.Listen("tcp", udpAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "opening TCP listener: %v\n", err)
+			os.Exit(1)
+		}
+		
 		var fallbackAddr *net.UDPAddr
 		if fallbackAddrString != "" {
 			fallbackAddr, err = net.ResolveUDPAddr("udp", fallbackAddrString)
@@ -1567,7 +1651,7 @@ Example:
 			}
 		}
 
-		err = run(privkey, domains, upstream, dnsConn, fallbackAddr, idleTimeout, keepAlive, queueSize, kcpWindowSize, queueOverflowMode, wireConfig)
+		err = run(privkey, domains, upstream, dnsConn, tcpListener, fallbackAddr, idleTimeout, keepAlive, queueSize, kcpWindowSize, queueOverflowMode, wireConfig)
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
