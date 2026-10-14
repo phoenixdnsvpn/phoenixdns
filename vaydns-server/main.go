@@ -1125,7 +1125,7 @@ func computeMaxEncodedPayload(limit int, encode func([]byte) []byte) int {
 			},
 		},
 	}
-	resp, _, _ := responseFor(query, []dns.Name{})
+	resp, _, _ := responseFor(query, []dns.Name{}, false)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -1212,7 +1212,7 @@ func computeMaxEncodedPayloadMultiRR(limit int, chunkSize int) int {
 			},
 		},
 	}
-	resp, _, _ := responseFor(query, []dns.Name{})
+	resp, _, _ := responseFor(query, []dns.Name{}, false)
 
 	// Binary search: find max payload that fits when split into chunkSize RRs.
 	low := 0
