@@ -368,7 +368,9 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 // send on c.pollChan to permit sendLoop to send an immediate polling queries.
 func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 	for {
-		var buf [4096]byte
+		// Expanded buffer to 65535 bytes to support massive uncapped 
+		// TCP, DoT, and DoH payloads without truncation.
+		var buf [65535]byte		
 		n, addr, err := transport.ReadFrom(buf[:])
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
