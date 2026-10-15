@@ -141,7 +141,8 @@ type TunnelServer struct {
 	DownloadMinMTU int
 	DownloadMaxMTU int
 	
-	DisableDynamicMTU bool		
+	DisableDynamicMTU bool
+	MTUDiscoveryRetries int // Default 1, max 3			
 }
 
 // NewTunnelServer creates a TunnelServer from a domain string and hex-encoded
@@ -481,11 +482,20 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 
 	binarySearch := func(reqType byte, low, high int) int {
 		best := -1 
+		
+		// 0 retries = 1 attempt. 1 retry = 2 attempts.
+		maxAttempts := t.TunnelServer.MTUDiscoveryRetries + 1
+		if maxAttempts > 4 {
+			maxAttempts = 4
+		} else if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+				
 		for low <= high {
 			mid := (low + high) / 2
 			success := false
 			//for attempt := 0; attempt < 3; attempt++ {
-			for attempt := 0; attempt < 1; attempt++ {			
+			for attempt := 0; attempt < maxAttempts; attempt++ {			
 				tSize, rSize := mid, mid
 				if reqType == 0x03 {
 					tSize = 25

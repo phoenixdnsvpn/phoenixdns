@@ -70,6 +70,7 @@ func main() {
 	// --- NEW FLAGS ---
 	var disableDynamicMTU bool
 	var fixedMTU int
+	var mtuDiscoveryRetries int
 	
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -159,6 +160,7 @@ Known TLS fingerprints for -utls are:
 	// --- NEW FLAGS MAP ---
 	flag.BoolVar(&disableDynamicMTU, "disable-mtu-discovery", false, "disable dynamic MTU discovery and use static calculation")
 	flag.IntVar(&fixedMTU, "mtu", 0, "force a specific upload MTU (requires -disable-mtu-discovery)")
+	flag.IntVar(&mtuDiscoveryRetries, "mtu-discovery-retries", 1, "number of retries for MTU discovery probes (0-3)")
 
 	var logLevel string
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warning, error)")
@@ -358,6 +360,11 @@ Known TLS fingerprints for -utls are:
 		os.Exit(1)
 	}
 	
+	if mtuDiscoveryRetries < 0 || mtuDiscoveryRetries > 3 {
+		fmt.Fprintf(os.Stderr, "-mtu-discovery-retries must be between 0 and 3\n")
+		os.Exit(1)
+	}
+		
 	// Apply -dnstt-compat overrides.
 	if compatDnstt {
 		if recordTypeStr != "txt" {
@@ -430,6 +437,7 @@ Known TLS fingerprints for -utls are:
 	// --- MAP NEW FLAGS ---
 	ts.DisableDynamicMTU = disableDynamicMTU
 	ts.MTU = fixedMTU
+	ts.MTUDiscoveryRetries = mtuDiscoveryRetries
 	
 	// Build tunnel.
 	tunnel, err := client.NewTunnel(resolver, ts)
