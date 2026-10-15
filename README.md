@@ -141,7 +141,7 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-p
 | Flag                 | Description                                | Default    |
 | -------------------- | ------------------------------------------ | ---------- |
 | `-udp ADDR`          | Listen address for UDP and concurrent TCP DNS                     | (required) |
-| `-domain NAME`       | Tunnel domain                                                     | (required) |
+| `-domain NAME`       | Tunnel domain. multi domains are separated by , e.g. t.example1.com,t.example2.com | (required) |
 | `-upstream ADDR`     | Forward tunnel streams to this TCP address                        | (required) |
 | `-privkey-file PATH` | Server private key file                                           | —          |
 | `-privkey HEX`       | Server private key as hex string                                  | —          |
@@ -176,7 +176,7 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-p
 
 | Flag                | Description                                                     |
 | ------------------- | --------------------------------------------------------------- |
-| `-domain NAME`      | Tunnel domain                                                   |
+| `-domain NAME`      | Tunnel domain. multi domains are separated by , e.g. t.example1.com,t.example2.com |
 | `-listen ADDR`      | Local TCP listen address                                        |
 | `-pubkey-file PATH` | Server public key file                                          |
 | `-pubkey HEX`       | Server public key as hex string (alternative to `-pubkey-file`) |
