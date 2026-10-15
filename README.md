@@ -211,13 +211,15 @@ These flags only apply when using `-udp`. By default, each query is sent from a 
 
 These flags apply to all transports (UDP, TCP, DoH, DoT) on the client side. The server has the same queue flags. Dynamic MTU Discovery actively probes the connection on startup to find the maximum transmission unit to prevent dropped packets.
 
-| Flag                   | Description                                                        | Default |
+| Flag                     | Description                                                        | Default |
 | ------------------------ | ------------------------------------------------------------------ | ------- |
 | `-upload-min-mtu N`      | Minimum upload MTU to probe                                        | `40`    |
 | `-upload-max-mtu N`      | Maximum upload MTU to probe                                        | `140`   |
 | `-download-min-mtu N`    | Minimum download MTU to probe                                      | `200`   |
 | `-download-max-mtu N`    | Maximum download MTU to probe                                      | `1232`  |
 | `-disable-mtu-discovery` | Skips dynamic network probing and uses a safe fallback calculation | `false` |
+| `-mtu-discovery-retries N` | Number of retries for MTU discovery probes (0-3)                 | `1`     |
+| `-mtu N`                 | Force a specific upload MTU (requires -disable-mtu-discovery)      | `0`     |
 | `-queue-size N`          | Packet queue size for transport and DNS layers                     | `512`   |
 | `-kcp-window-size N`     | KCP send/receive window size in packets (0 = queue-size/2). Must be <= queue-size. | `0`     |
 | `-queue-overflow MODE`   | Queue overflow behavior: `drop` (silent discard, KCP retransmits) or `block` (backpressure). | `drop`  |
