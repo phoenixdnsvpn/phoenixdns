@@ -644,7 +644,8 @@ func openStreamWithTimeout(conv uint32, timeout time.Duration, open func() (net.
 		return r.stream, nil
 	case <-timer.C:
 		go func() {
-			if r, ok := <-ch; ok && r.stream != nil {
+			// FIX: Ensure no error occurred before trusting the stream pointer
+			if r, ok := <-ch; ok && r.err == nil && r.stream != nil {
 				r.stream.Close()
 			}
 		}()
@@ -683,7 +684,11 @@ func (t *Tunnel) OpenStream() (net.Conn, error) {
 
 	// Wrap the call to explicitly return the net.Conn interface
 	stream, err := openStreamWithTimeout(conv, timeout, func() (net.Conn, error) {
-		return t.yamuxSession.OpenStream()
+		s, err := t.yamuxSession.OpenStream()
+		if err != nil {
+			return nil, err // Returns a true, untyped nil interface
+		}
+		return s, nil
 	})
 	if err != nil {
 		return nil, err
@@ -975,9 +980,13 @@ func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *yamux.Session, error)
 
 // handleConn forwards a single TCP connection through the tunnel session.
 func (t *Tunnel) handleConn(local *net.TCPConn, sess *yamux.Session, conv uint32) error {
-	// Wrap the call to explicitly return the net.Conn interface
+// Wrap the call to explicitly return the net.Conn interface
 	stream, err := openStreamWithTimeout(conv, t.OpenStreamTimeout, func() (net.Conn, error) {
-		return sess.OpenStream()
+		s, err := sess.OpenStream()
+		if err != nil {
+			return nil, err // Returns a true, untyped nil interface
+		}
+		return s, nil
 	})
 	if err != nil {
 		return err
