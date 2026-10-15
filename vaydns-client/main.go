@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	vaydns-client [-doh URL|-dot ADDR|-udp ADDR] [-pubkey HEX|-pubkey-file FILENAME] -domain DOMAIN -listen LOCALADDR
+//	vaydns-client [-doh URL|-dot ADDR|-tcp ADDR|-udp ADDR] [-pubkey HEX|-pubkey-file FILENAME] -domain DOMAIN -listen LOCALADDR
 package main
 
 import (
@@ -139,7 +139,7 @@ Known TLS fingerprints for -utls are:
 	flag.StringVar(&reconnectMinStr, "reconnect-min", client.DefaultReconnectDelay.String(), "minimum delay before retrying session creation (e.g. 500ms, 1s)")
 	flag.StringVar(&reconnectMaxStr, "reconnect-max", client.DefaultReconnectMaxDelay.String(), "maximum delay before retrying session creation (e.g. 5s, 30s)")
 	flag.StringVar(&sessionCheckIntervalStr, "session-check-interval", client.DefaultSessionCheckInterval.String(), "interval for checking whether the current session is still alive (e.g. 100ms, 500ms)")
-	flag.StringVar(&openStreamTimeoutStr, "open-stream-timeout", client.DefaultOpenStreamTimeout.String(), "timeout for opening an smux stream (e.g. 500ms, 3s)")
+	flag.StringVar(&openStreamTimeoutStr, "open-stream-timeout", client.DefaultOpenStreamTimeout.String(), "timeout for opening a multiplexed stream (e.g. 500ms, 3s)")
 	flag.IntVar(&maxStreams, "max-streams", client.DefaultMaxStreams, "max concurrent streams per session (0 = unlimited)")
 	flag.IntVar(&udpWorkers, "udp-workers", client.DefaultUDPWorkers, "number of concurrent UDP worker goroutines")
 	flag.BoolVar(&udpSharedSocket, "udp-shared-socket", false, "use a single shared UDP socket instead of per-query sockets")
@@ -255,11 +255,11 @@ Known TLS fingerprints for -utls are:
 		transportCount++
 	}
 	if transportCount == 0 {
-		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
+		fmt.Fprintf(os.Stderr, "one of -doh, -dot, -tcp, or -udp is required\n")
 		os.Exit(1)
 	}
 	if transportCount > 1 {
-		fmt.Fprintf(os.Stderr, "only one of -doh, -dot, and -udp may be given\n")
+		fmt.Fprintf(os.Stderr, "only one of -doh, -dot, -tcp, and -udp may be given\n")
 		os.Exit(1)
 	}
 
@@ -382,8 +382,15 @@ Known TLS fingerprints for -utls are:
 			fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 			os.Exit(1)
 		}
+		
+		if !explicitFlags["download-max-mtu"] {
+			if resolverType == client.ResolverTypeTCP || resolverType == client.ResolverTypeDOT || resolverType == client.ResolverTypeDOH {
+			downloadMaxMTU = 4096
+			}
+		}		
 	}
 
+	
 	// Build resolver.
 	resolver, err := client.NewResolver(resolverType, resolverAddr)
 	if err != nil {

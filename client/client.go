@@ -38,7 +38,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
+	"github.com/hashicorp/yamux"
 )
 
 // Default timeouts for VayDNS mode.
@@ -217,6 +217,8 @@ type Tunnel struct {
 	KCPWindowSize        int                           // default: PacketQueueSize/2
 	QueueOverflowMode    turbotunnel.QueueOverflowMode // default: drop
 
+	mu sync.Mutex // Added for safe teardown
+	
 	// internal state
 	wireConfig    turbotunnel.WireConfig
 	forgedStats   *ForgedStats
@@ -224,9 +226,10 @@ type Tunnel struct {
 	dnsPacketConn *DNSPacketConn
 	kcpConn       *kcp.UDPSession
 	noiseChannel  io.ReadWriteCloser
-	smuxSession   *smux.Session
+	yamuxSession  *yamux.Session // Replaced smux
 	remoteAddr    net.Addr
 }
+
 
 // NewTunnel creates a Tunnel with the given resolver and server configuration.
 // Zero-value fields use sensible defaults.
@@ -405,11 +408,13 @@ func (t *Tunnel) InitiateDNSPacketConn(domain dns.Name) error {
 
 // DiscoverMTU actively probes the network path to find the maximum fragmentation limit.
 func (t *Tunnel) DiscoverMTU() (int, error) {
-	// Base limits: calculate mathematical maximums for the domain[cite: 6]
 	mathUploadCeiling := DNSNameCapacity(t.TunnelServer.Addr, t.TunnelServer.effectiveMaxQnameLen(), t.TunnelServer.MaxNumLabels) - t.wireConfig.DataOverhead()
-	mathDownloadCeiling := 1232 // Standard safe EDNS0 limit
+	
+	maxDownloadCeiling := 1232 // Standard safe EDNS0 limit for UDP
+	if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
+		maxDownloadCeiling = 65535 // Uncapped stream limit for TCP/DoT/DoH
+	}
 
-	// Apply user-defined constraints, capped by mathematical reality
 	upMax := t.TunnelServer.UploadMaxMTU
 	if upMax > mathUploadCeiling {
 		upMax = mathUploadCeiling
@@ -420,8 +425,8 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 	}
 
 	downMax := t.TunnelServer.DownloadMaxMTU
-	if downMax > mathDownloadCeiling {
-		downMax = mathDownloadCeiling
+	if downMax > maxDownloadCeiling {
+		downMax = maxDownloadCeiling
 	}
 	downMin := t.TunnelServer.DownloadMinMTU
 	if downMin > downMax {
@@ -444,13 +449,13 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 			binary.BigEndian.PutUint16(req[9:11], uint16(reqSize))
 		}
 
-		// Write raw probe directly over DNSPacketConn (bypassing KCP)[cite: 5]
 		_, err := t.dnsPacketConn.WriteTo(req, t.remoteAddr)
 		if err != nil {
 			return false
 		}
 
-		deadline := time.Now().Add(2 * time.Second)
+		// deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(1 * time.Second)		
 		buf := make([]byte, 4096)
 		for {
 			if time.Now().After(deadline) {
@@ -459,11 +464,10 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 			t.dnsPacketConn.SetReadDeadline(deadline)
 			n, _, err := t.dnsPacketConn.ReadFrom(buf)
 			if err != nil {
-				return false // Dropped or timed out
+				return false 
 			}
 
 			p := buf[:n]
-			// Verify cryptographic echo to ensure no silent truncation
 			if len(p) >= 9 && bytes.HasPrefix(p, magic) && bytes.Equal(p[5:9], code) {
 				if reqType == 0x01 && p[4] == 0x02 && len(p) >= 11 {
 					return int(binary.BigEndian.Uint16(p[9:11])) == targetSize
@@ -476,11 +480,12 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 	}
 
 	binarySearch := func(reqType byte, low, high int) int {
-		best := -1 // Fails cleanly if 0 probes succeed
+		best := -1 
 		for low <= high {
 			mid := (low + high) / 2
 			success := false
-			for attempt := 0; attempt < 3; attempt++ {
+			//for attempt := 0; attempt < 3; attempt++ {
+			for attempt := 0; attempt < 1; attempt++ {			
 				tSize, rSize := mid, mid
 				if reqType == 0x03 {
 					tSize = 25
@@ -514,23 +519,22 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 
 	log.Infof("Discovered Asymmetric MTU - Upload: %d, Download: %d", up, down)
 	
-	// Reset deadline for normal KCP operation
 	t.dnsPacketConn.SetReadDeadline(time.Time{})
-	
-	// ONLY return the Upload MTU for the client to use. 
-	// The client's KCP session only dictates OUTGOING frame sizes. 
-	// The server will handle large download frames based on its own config.
 	return up, nil 
 }
 
 // InitiateKCPConn opens a KCP connection over the DNS packet connection.
-// If mtu is 0, it is dynamically discovered via the network path.
 func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	if mtu <= 0 {
-		var err error
-		mtu, err = t.DiscoverMTU()
-		if err != nil {
-			return fmt.Errorf("MTU discovery failed: %v", err)
+		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
+			mtu = 4096 
+			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
+		} else {
+			var err error
+			mtu, err = t.DiscoverMTU()
+			if err != nil {
+				return fmt.Errorf("MTU discovery failed: %v", err)
+			}
 		}
 		t.TunnelServer.MTU = mtu
 	}
@@ -546,13 +550,13 @@ func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	}
 	log.Infof("session %08x ready", conn.GetConv())
 	conn.SetStreamMode(true)
+	
 	if t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeTCP {
-		// nodelay=1, interval=200ms, resend=2, nc=1
 		conn.SetNoDelay(1, 200, 2, 1)
 	} else {
 		conn.SetNoDelay(0, 0, 0, 1)
-	}	
-
+	}
+	
 	conn.SetWindowSize(t.effectiveKCPWindowSize(), t.effectiveKCPWindowSize())
 	if rc := conn.SetMtu(mtu); !rc {
 		conn.Close()
@@ -560,6 +564,25 @@ func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	}
 
 	t.kcpConn = conn
+	return nil
+}
+
+// InitiateYamuxSession establishes a multiplexed session over the Noise channel.
+func (t *Tunnel) InitiateYamuxSession() error {
+	t.applyDefaults()
+
+	yamuxConfig := yamux.DefaultConfig()
+	yamuxConfig.EnableKeepAlive = true
+	yamuxConfig.KeepAliveInterval = t.KeepAlive
+	//yamuxConfig.ConnectionWriteTimeout = t.IdleTimeout
+	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second
+	yamuxConfig.MaxStreamWindowSize = 1024 * 1024
+
+	sess, err := yamux.Client(t.noiseChannel, yamuxConfig)
+	if err != nil {
+		return fmt.Errorf("opening yamux session: %v", err)
+	}
+	t.yamuxSession = sess
 	return nil
 }
 
@@ -588,29 +611,10 @@ func noiseHandshake(conn *kcp.UDPSession, pubkey []byte, timeout time.Duration) 
 	return rw, nil
 }
 
-// InitiateSmuxSession establishes a multiplexed session over the Noise channel.
-func (t *Tunnel) InitiateSmuxSession() error {
-	t.applyDefaults()
-
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = t.KeepAlive
-	smuxConfig.KeepAliveTimeout = t.IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
-	sess, err := smux.Client(t.noiseChannel, smuxConfig)
-	if err != nil {
-		return fmt.Errorf("opening smux session: %v", err)
-	}
-	t.smuxSession = sess
-	return nil
-}
-
-// openStreamWithTimeout opens an smux stream with a timeout. If the open
-// succeeds after the timeout, the late stream is closed to avoid leaking
-// capacity.
-func openStreamWithTimeout(conv uint32, timeout time.Duration, open func() (*smux.Stream, error)) (*smux.Stream, error) {
+// openStreamWithTimeout opens a yamux stream with a timeout. 
+func openStreamWithTimeout(conv uint32, timeout time.Duration, open func() (net.Conn, error)) (net.Conn, error) {
 	type result struct {
-		stream *smux.Stream
+		stream net.Conn
 		err    error
 	}
 	ch := make(chan result, 1)
@@ -653,8 +657,8 @@ func shouldLogCopyError(err error) bool {
 
 // OpenStream opens a new multiplexed stream. Returns a net.Conn.
 func (t *Tunnel) OpenStream() (net.Conn, error) {
-	if t.smuxSession == nil {
-		return nil, fmt.Errorf("smux session is not initialized")
+	if t.yamuxSession == nil {
+		return nil, fmt.Errorf("yamux session is not initialized")
 	}
 
 	timeout := t.OpenStreamTimeout
@@ -667,11 +671,20 @@ func (t *Tunnel) OpenStream() (net.Conn, error) {
 		conv = t.kcpConn.GetConv()
 	}
 
-	stream, err := openStreamWithTimeout(conv, timeout, t.smuxSession.OpenStream)
+	// Wrap the call to explicitly return the net.Conn interface
+	stream, err := openStreamWithTimeout(conv, timeout, func() (net.Conn, error) {
+		return t.yamuxSession.OpenStream()
+	})
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("stream %08x:%d ready", conv, stream.ID())
+	
+	streamID := uint32(0)
+	if yStream, ok := stream.(*yamux.Stream); ok {
+		streamID = yStream.StreamID()
+	}
+	log.Debugf("stream %08x:%d ready", conv, streamID)
+	
 	return stream, nil
 }
 
@@ -710,14 +723,21 @@ func (t *Tunnel) Handle(lconn *net.TCPConn) error {
 
 // Close tears down the tunnel and all its layers.
 func (t *Tunnel) Close() error {
-	if t.smuxSession != nil {
-		t.smuxSession.Close()
-		t.smuxSession = nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.yamuxSession != nil {
+		t.yamuxSession.Close()
+		t.yamuxSession = nil
 	}
 	if t.noiseChannel != nil {
 		t.noiseChannel.Close()
 		t.noiseChannel = nil
 	}
+	
+	// Allow upper layers to safely flush before destroying the transport socket
+	time.Sleep(500 * time.Millisecond)
+		
 	if t.kcpConn != nil {
 		log.Debugf("session %08x closed", t.kcpConn.GetConv())
 		t.kcpConn.Close()
@@ -798,7 +818,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 
 		// Create a new tunnel session with exponential backoff.
 		var conn *kcp.UDPSession
-		var sess *smux.Session
+		var sess *yamux.Session
 		delay = t.ReconnectMinDelay
 		for {
 			// Bypass MTU discovery if requested
@@ -813,7 +833,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 				log.Infof("MTU discovery bypassed. Using fixed MTU: %d", mtuToUse)
 			}
 					
-			conn, sess, err = t.createSession(0)
+			conn, sess, err = t.createSession(mtuToUse)
 			if err == nil {
 				break
 			}
@@ -863,7 +883,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 			default:
 			}
 
-			go func(sess *smux.Session, conv uint32) {
+			go func(sess *yamux.Session, conv uint32) {
 				if sem != nil {
 					sem <- struct{}{}
 					defer func() { <-sem }()
@@ -878,18 +898,25 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 
 		log.Warnf("session %08x closed, reconnecting", conv)
 		sess.Close()
+		// Allow Yamux 500ms to gracefully flush streams before destroying KCP
+		time.Sleep(500 * time.Millisecond)		
 		conn.Close()
 		t.closeTransportLayers()
 	}
 }
 
-// createSession creates a KCP+Noise+smux session (used by ListenAndServe).
-func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *smux.Session, error) {
+// createSession creates a KCP+Noise+yamux session (used by ListenAndServe).
+func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *yamux.Session, error) {
 	if mtu <= 0 {
-		var err error
-		mtu, err = t.DiscoverMTU()
-		if err != nil {
-			return nil, nil, fmt.Errorf("MTU discovery failed: %v", err)
+		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
+			mtu = 4096 
+			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
+		} else {
+			var err error
+			mtu, err = t.DiscoverMTU()
+			if err != nil {
+				return nil, nil, fmt.Errorf("MTU discovery failed: %v", err)
+			}
 		}
 		t.TunnelServer.MTU = mtu
 	}
@@ -919,32 +946,43 @@ func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *smux.Session, error) 
 		return nil, nil, err
 	}
 
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = t.KeepAlive
-	smuxConfig.KeepAliveTimeout = t.IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
-	sess, err := smux.Client(rw, smuxConfig)
+	yamuxConfig := yamux.DefaultConfig()
+	yamuxConfig.EnableKeepAlive = true
+	yamuxConfig.KeepAliveInterval = t.KeepAlive
+	// yamuxConfig.ConnectionWriteTimeout = t.IdleTimeout
+	// Give Yamux a massive 120s buffer to survive KCP packet loss over DNS.	
+	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second	
+	yamuxConfig.MaxStreamWindowSize = 1024 * 1024
+
+	sess, err := yamux.Client(rw, yamuxConfig)
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("opening smux session: %v", err)
+		return nil, nil, fmt.Errorf("opening yamux session: %v", err)
 	}
 
 	return conn, sess, nil
 }
 
 // handleConn forwards a single TCP connection through the tunnel session.
-func (t *Tunnel) handleConn(local *net.TCPConn, sess *smux.Session, conv uint32) error {
-	stream, err := openStreamWithTimeout(conv, t.OpenStreamTimeout, sess.OpenStream)
+func (t *Tunnel) handleConn(local *net.TCPConn, sess *yamux.Session, conv uint32) error {
+	// Wrap the call to explicitly return the net.Conn interface
+	stream, err := openStreamWithTimeout(conv, t.OpenStreamTimeout, func() (net.Conn, error) {
+		return sess.OpenStream()
+	})
 	if err != nil {
 		return err
 	}
 
+	streamID := uint32(0)
+	if yStream, ok := stream.(*yamux.Stream); ok {
+		streamID = yStream.StreamID()
+	}
+
 	defer func() {
-		log.Debugf("stream %08x:%d closed", conv, stream.ID())
+		log.Debugf("stream %08x:%d closed", conv, streamID)
 		stream.Close()
 	}()
-	log.Infof("stream %08x:%d ready", conv, stream.ID())
+	log.Infof("stream %08x:%d ready", conv, streamID)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -952,7 +990,7 @@ func (t *Tunnel) handleConn(local *net.TCPConn, sess *smux.Session, conv uint32)
 		defer wg.Done()
 		_, err := io.Copy(stream, local)
 		if shouldLogCopyError(err) {
-			log.Warnf("stream %08x:%d copy stream←local: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy stream←local: %v", conv, streamID, err)
 		}
 		local.CloseRead()
 		stream.Close()
@@ -961,7 +999,7 @@ func (t *Tunnel) handleConn(local *net.TCPConn, sess *smux.Session, conv uint32)
 		defer wg.Done()
 		_, err := io.Copy(local, stream)
 		if shouldLogCopyError(err) {
-			log.Warnf("stream %08x:%d copy local←stream: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy local←stream: %v", conv, streamID, err)
 		}
 		local.CloseWrite()
 		local.CloseRead()

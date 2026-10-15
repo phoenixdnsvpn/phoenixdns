@@ -70,7 +70,7 @@ import (
 	"github.com/net2share/vaydns/noise"
 	"github.com/net2share/vaydns/turbotunnel"
 	"github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/smux"
+	"github.com/hashicorp/yamux"
 )
 
 const (
@@ -218,14 +218,14 @@ func readKeyFromFile(filename string) ([]byte, error) {
 }
 
 // handleStream bidirectionally connects a client stream with a TCP socket
-// addressed by upstream.
-func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
+// addressed by upstream. It accepts the explicit streamID for logging.
+func handleStream(stream net.Conn, upstream string, conv uint32, streamID uint32) error {
 	dialer := net.Dialer{
 		Timeout: upstreamDialTimeout,
 	}
 	upstreamConn, err := dialer.Dial("tcp", upstream)
 	if err != nil {
-		return fmt.Errorf("stream %08x:%d connect upstream: %v", conv, stream.ID(), err)
+		return fmt.Errorf("stream %08x:%d connect upstream: %v", conv, streamID, err)
 	}
 	defer upstreamConn.Close()
 	upstreamTCPConn := upstreamConn.(*net.TCPConn)
@@ -236,11 +236,10 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 		defer wg.Done()
 		_, err := io.Copy(stream, upstreamTCPConn)
 		if err == io.EOF {
-			// smux Stream.Write may return io.EOF.
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Warnf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy stream←upstream: %v", conv, streamID, err)
 		}
 		upstreamTCPConn.CloseRead()
 		stream.Close()
@@ -249,11 +248,10 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 		defer wg.Done()
 		_, err := io.Copy(upstreamTCPConn, stream)
 		if err == io.EOF {
-			// smux Stream.WriteTo may return io.EOF.
 			err = nil
 		}
 		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Warnf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
+			log.Warnf("stream %08x:%d copy upstream←stream: %v", conv, streamID, err)
 		}
 		upstreamTCPConn.CloseWrite()
 	}()
@@ -262,8 +260,8 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 	return nil
 }
 
-// acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
-// then awaits smux streams. It passes each stream to handleStream.
+// acceptStreams wraps a KCP session in a Noise channel and a yamux.Session,
+// then awaits yamux streams. It passes each stream to handleStream.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTimeout time.Duration, keepAlive time.Duration) error {
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := serverNoiseHandshake(conn, privkey, defaultHandshakeTimeout)
@@ -271,13 +269,15 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTi
 		return err
 	}
 
-	// Put an smux session on top of the encrypted Noise channel.
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = 2
-	smuxConfig.KeepAliveInterval = keepAlive
-	smuxConfig.KeepAliveTimeout = idleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	sess, err := smux.Server(rw, smuxConfig)
+	// Put a yamux session on top of the encrypted Noise channel.
+	yamuxConfig := yamux.DefaultConfig()
+	yamuxConfig.EnableKeepAlive = true
+	yamuxConfig.KeepAliveInterval = keepAlive
+	// yamuxConfig.ConnectionWriteTimeout = idleTimeout
+	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second
+	yamuxConfig.MaxStreamWindowSize = 1024 * 1024 // 1MB Buffer
+	
+	sess, err := yamux.Server(rw, yamuxConfig)
 	if err != nil {
 		return err
 	}
@@ -291,15 +291,21 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTi
 			}
 			return err
 		}
-		log.Infof("stream %08x:%d ready", conn.GetConv(), stream.ID())
+		
+		// Extract Yamux StreamID directly since it's already a *yamux.Stream
+		streamID := stream.StreamID()
+		
+		log.Infof("stream %08x:%d ready", conn.GetConv(), streamID)
 		go func() {
 			defer func() {
-				log.Debugf("stream %08x:%d closed", conn.GetConv(), stream.ID())
+				log.Debugf("stream %08x:%d closed", conn.GetConv(), streamID)
 				stream.Close()
 			}()
-			err := handleStream(stream, upstream, conn.GetConv())
+			
+			// Pass streamID explicitly into handleStream
+			err := handleStream(stream, upstream, conn.GetConv(), streamID)
 			if err != nil {
-				log.Warnf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				log.Warnf("stream %08x:%d handleStream: %v", conn.GetConv(), streamID, err)
 			}
 		}()
 	}
