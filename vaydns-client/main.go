@@ -392,7 +392,7 @@ Known TLS fingerprints for -utls are:
 		
 		if !explicitFlags["download-max-mtu"] {
 			if resolverType == client.ResolverTypeTCP || resolverType == client.ResolverTypeDOT || resolverType == client.ResolverTypeDOH {
-			downloadMaxMTU = 4096
+			downloadMaxMTU = 1232
 			}
 		}		
 	}

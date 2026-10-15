@@ -275,7 +275,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, idleTi
 	yamuxConfig.KeepAliveInterval = keepAlive
 	// yamuxConfig.ConnectionWriteTimeout = idleTimeout
 	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second
-	yamuxConfig.MaxStreamWindowSize = 1024 * 1024 // 1MB Buffer
+	yamuxConfig.MaxStreamWindowSize = 256 * 1024 // 256 KB Buffer
 	
 	sess, err := yamux.Server(rw, yamuxConfig)
 	if err != nil {

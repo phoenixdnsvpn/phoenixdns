@@ -413,7 +413,7 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 	
 	maxDownloadCeiling := 1232 // Standard safe EDNS0 limit for UDP
 	if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
-		maxDownloadCeiling = 65535 // Uncapped stream limit for TCP/DoT/DoH
+		maxDownloadCeiling = t.TunnelServer.DownloadMaxMTU // Uncapped stream limit for TCP/DoT/DoH
 	}
 
 	upMax := t.TunnelServer.UploadMaxMTU
@@ -537,7 +537,7 @@ func (t *Tunnel) DiscoverMTU() (int, error) {
 func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	if mtu <= 0 {
 		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
-			mtu = 4096 
+			mtu = t.TunnelServer.UploadMaxMTU 
 			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
 		} else {
 			var err error
@@ -586,7 +586,7 @@ func (t *Tunnel) InitiateYamuxSession() error {
 	yamuxConfig.KeepAliveInterval = t.KeepAlive
 	//yamuxConfig.ConnectionWriteTimeout = t.IdleTimeout
 	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second
-	yamuxConfig.MaxStreamWindowSize = 1024 * 1024
+	yamuxConfig.MaxStreamWindowSize = 256 * 1024
 
 	sess, err := yamux.Client(t.noiseChannel, yamuxConfig)
 	if err != nil {
@@ -919,7 +919,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *yamux.Session, error) {
 	if mtu <= 0 {
 		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
-			mtu = 4096 
+			mtu = t.TunnelServer.UploadMaxMTU
 			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
 		} else {
 			var err error
@@ -962,7 +962,7 @@ func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *yamux.Session, error)
 	// yamuxConfig.ConnectionWriteTimeout = t.IdleTimeout
 	// Give Yamux a massive 120s buffer to survive KCP packet loss over DNS.	
 	yamuxConfig.ConnectionWriteTimeout = 120 * time.Second	
-	yamuxConfig.MaxStreamWindowSize = 1024 * 1024
+	yamuxConfig.MaxStreamWindowSize = 256 * 1024
 
 	sess, err := yamux.Client(rw, yamuxConfig)
 	if err != nil {
