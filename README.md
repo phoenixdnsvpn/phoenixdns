@@ -1,17 +1,21 @@
 # VayDNS
 
-Userspace DNS tunnel with support for DoH, DoT, and plaintext UDP.
+Userspace DNS tunnel with support for DoH, DoT, plaintext UDP, and plaintext TCP.
 
 > VayDNS is a fork of [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield, with protocol optimizations and additional features. The wire protocol differs from upstream dnstt by default, but the `-dnstt-compat` flag enables interoperability with original dnstt clients and servers.
 
 ## Features
 
-- **Multiple transports** — DNS over HTTPS (DoH), DNS over TLS (DoT), and plaintext UDP
+- **Multiple transports** — Multiple transports — DNS over HTTPS (DoH), DNS over TLS (DoT), plaintext UDP, and DNS-over-TCP.
+- **Dynamic MTU Discovery** — Actively probes network boundaries to automatically negotiate the maximum safe payload size without manual configuration.
+- **Concurrent TCP & UDP Listener** — The server seamlessly handles both UDP and TCP DNS queries simultaneously on the same port.
+- **UDP Truncation Fallback (TC Flag)** — Automatically sets the TC (Truncation) flag for oversized UDP payloads, seamlessly prompting the client to retry the query over TCP.
 - **Reliable delivery** — KCP/smux session protocol with automatic retransmission
 - **End-to-end encryption** — Noise protocol with server authentication by public key
 - **TLS fingerprint camouflage** — uTLS randomizes the client's TLS fingerprint
 - **Censorship resistance** — per-query UDP sockets with forged-response filtering
 - **Auto-recovery** — client automatically reconnects on session failure
+- **Multi-Domain** Support — The server can route traffic for multiple distinct tunnel domains simultaneously.
 
 ## Architecture
 
@@ -53,6 +57,8 @@ Copy `server.pub` to the client. Keep `server.key` on the server only.
   -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
+(Note: The -udp flag automatically binds a concurrent TCP listener on the same port to support DNS-over-TCP and truncation fallbacks).
+
 You also need something for the server to forward to (a proxy, SSH, etc.). For testing, use an Ncat listener:
 
 ```sh
@@ -70,6 +76,13 @@ Using plaintext UDP (no covertness):
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
+Using plaintext TCP (bypasses UDP filtering/shaping):
+
+```sh
+./vaydns-client -tcp 8.8.8.8:53 \
+  -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+```
+  
 Using DoH:
 
 ```sh
@@ -112,9 +125,13 @@ The server needs to receive DNS on port 53. Rather than running as root, listen 
 
 ```sh
 sudo iptables -I INPUT -p udp --dport 5300 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 5300 -j ACCEPT
 sudo iptables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
+sudo iptables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-ports 5300
 sudo ip6tables -I INPUT -p udp --dport 5300 -j ACCEPT
+sudo ip6tables -I INPUT -p tcp --dport 5300 -j ACCEPT
 sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
+sudo ip6tables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-ports 5300
 ```
 
 ## Configuration reference
@@ -123,13 +140,16 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-p
 
 | Flag                 | Description                                | Default    |
 | -------------------- | ------------------------------------------ | ---------- |
-| `-udp ADDR`          | Listen address for UDP DNS                                        | (required) |
+| `-udp ADDR`          | Listen address for UDP and concurrent TCP DNS                     | (required) |
 | `-domain NAME`       | Tunnel domain                                                     | (required) |
 | `-upstream ADDR`     | Forward tunnel streams to this TCP address                        | (required) |
 | `-privkey-file PATH` | Server private key file                                           | —          |
 | `-privkey HEX`       | Server private key as hex string                                  | —          |
 | `-gen-key`           | Generate a new keypair and exit                                   | —          |
-| `-mtu N`             | Max UDP payload size for responses                                | `1232`     |
+| `-upload-min-mtu N`  | Minimum upload MTU (for client parity)                            | `40`       |
+| `-upload-max-mtu N`  | Maximum upload MTU (for client parity)                            | `140`      |
+| `-download-min-mtu N`  | Minimum download MTU (for client parity)                        | `200`      |
+| `-download-max-mtu N`  | Maximum size of DNS responses (TCP is uncapped)                 | `1232`     |
 | `-idle-timeout D`    | Session idle timeout (must match client)                          | `10s`      |
 | `-keepalive D`       | Keepalive ping interval (must match client, must be < idle-timeout) | `2s`      |
 | `-fallback ADDR`     | UDP endpoint to forward non-DNS packets to (e.g. `127.0.0.1:8888`) | —          |
@@ -149,6 +169,7 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-p
 | ----------- | ------------------------------------------------ |
 | `-doh URL`  | Use DNS over HTTPS with the given resolver URL   |
 | `-dot ADDR` | Use DNS over TLS with the given resolver address |
+| `-tcp ADDR` | Use plaintext TCP DNS (bypasses UDP throttling)  |
 | `-udp ADDR` | Use plaintext UDP DNS (no covertness)            |
 
 #### Required
@@ -186,15 +207,20 @@ These flags only apply when using `-udp`. By default, each query is sent from a 
 | `-udp-shared-socket` | Use a single shared UDP socket instead of per-query sockets. By default, each query is sent from a new socket with a random ephemeral source port, making the tunnel harder to fingerprint or block by port. With this flag, all queries share one socket and source port for the lifetime of the client — blocking that port kills the tunnel. | `false` |
 | `-udp-accept-errors` | In per-query mode, accept the first DNS response regardless of RCODE instead of waiting for a NOERROR response. This disables forged response filtering — the worker stops waiting after the first forged response, so the real response is likely lost. Only useful for debugging; not recommended in production. Ignored when `-udp-shared-socket` is set. | `false` |
 
-#### Queue and KCP tuning
+#### Dynamic MTU & Queue Tuning
 
-These flags apply to all transports (UDP, DoH, DoT) on the client side. The server has the same flags.
+These flags apply to all transports (UDP, TCP, DoH, DoT) on the client side. The server has the same queue flags. Dynamic MTU Discovery actively probes the connection on startup to find the maximum transmission unit to prevent dropped packets.
 
 | Flag                   | Description                                                        | Default |
-| ---------------------- | ------------------------------------------------------------------ | ------- |
-| `-queue-size N`        | Packet queue size for transport and DNS layers                     | `512`   |
-| `-kcp-window-size N`   | KCP send/receive window size in packets (0 = queue-size/2). Must be <= queue-size. | `0`     |
-| `-queue-overflow MODE` | Queue overflow behavior: `drop` (silent discard, KCP retransmits) or `block` (backpressure). | `drop`  |
+| ------------------------ | ------------------------------------------------------------------ | ------- |
+| `-upload-min-mtu N`      | Minimum upload MTU to probe                                        | `40`    |
+| `-upload-max-mtu N`      | Maximum upload MTU to probe                                        | `140`   |
+| `-download-min-mtu N`    | Minimum download MTU to probe                                      | `200`   |
+| `-download-max-mtu N`    | Maximum download MTU to probe                                      | `1232`  |
+| `-disable-mtu-discovery` | Skips dynamic network probing and uses a safe fallback calculation | `false` |
+| `-queue-size N`          | Packet queue size for transport and DNS layers                     | `512`   |
+| `-kcp-window-size N`     | KCP send/receive window size in packets (0 = queue-size/2). Must be <= queue-size. | `0`     |
+| `-queue-overflow MODE`   | Queue overflow behavior: `drop` (silent discard, KCP retransmits) or `block` (backpressure). | `drop`  |
 
 > **Note:** `drop` is the correct default for most deployments. It matches the original dnstt design where KCP handles retransmission of locally dropped packets. `block` mode applies backpressure instead of dropping — this can help in some censored network conditions but may slow down UDP transport significantly. Both client and server can use different modes independently.
 
@@ -317,7 +343,7 @@ smux              (stream multiplexing)
 Noise             (encryption + authentication)
 KCP               (reliable delivery over datagrams)
 DNS messages
-DoH / DoT / UDP
+DoH / DoT / TCP / UDP
 ```
 
 An observer at the resolver level can see KCP headers but cannot read smux frames or application data.
@@ -345,7 +371,7 @@ If no key is provided, the server generates a temporary keypair on each start.
 
 ### Covertness
 
-DoH/DoT hides tunnel traffic from local network observers — they can see you're connecting to a resolver but not the tunnel destination or contents. An observer can likely infer from traffic volume that a tunnel is being used, but cannot determine the remote endpoint or read the contents. Without DoH/DoT (plaintext UDP), the tunnel is visible to anyone on the path, including its destination.
+DoH/DoT hides tunnel traffic from local network observers — they can see you're connecting to a resolver but not the tunnel destination or contents. An observer can likely infer from traffic volume that a tunnel is being used, but cannot determine the remote endpoint or read the contents. Without DoH/DoT (plaintext UDP or TCP), the tunnel is visible to anyone on the path, including its destination.
 
 Observers between the resolver and the tunnel server (including the resolver itself) can identify the tunnel and its destination, but cannot read the encrypted contents.
 
@@ -355,14 +381,14 @@ An observer watching traffic leaving the tunnel server can see any unencrypted d
 
 Upstream (client → server) payload depends on the domain name length. Shorter domains = more space.
 
-Downstream (server → client) payload depends on the UDP response size. The `-mtu` flag on the server controls the max UDP payload:
+Downstream (server → client) payload depends on the transport protocol and UDP response limits. For UDP, the -download-max-mtu flag on the server controls the max payload:
 
 ```sh
-./vaydns-server -mtu 512 -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+./vaydns-server -download-max-mtu 512 -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
-- Default: `1232` bytes (safe for most EDNS(0) resolvers)
-- Max practical: `1452` (above this, IP fragmentation may hurt performance)
+- UDP Default: `1232` bytes (safe for most EDNS(0) resolvers)
+- TCP Default: Uncapped (up to ~65000 bytes, currently set to 4096) due to inherent TCP stream stability.
 - Min compatible: `512` (reduced bandwidth)
 
 Both client and server log their effective MTU at startup. The server's effective MTU is the minimum guaranteed across all responses (some responses may have more space depending on the query size).
