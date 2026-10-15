@@ -62,8 +62,59 @@ jobs:
             vaydns-client-*
             vaydns-server-*
 
+  build-android:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - android_arch: arm64-v8a
+            goarch: arm64
+            cc_prefix: aarch64-linux-android
+          - android_arch: armeabi-v7a
+            goarch: arm
+            goarm: 7
+            cc_prefix: armv7a-linux-androideabi
+          - android_arch: x86_64
+            goarch: amd64
+            cc_prefix: x86_64-linux-android
+          - android_arch: x86
+            goarch: 386
+            cc_prefix: i686-linux-android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Set up Android NDK toolchain
+        run: |
+          NDK_PATH="${ANDROID_NDK_HOME}"
+          TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          API=24
+          
+          echo "CC=${TOOLCHAIN}/${{ matrix.cc_prefix }}${API}-clang" >> $GITHUB_ENV
+          echo "CXX=${TOOLCHAIN}/${{ matrix.cc_prefix }}${API}-clang++" >> $GITHUB_ENV
+
+      - name: Build Standalone Android Executables as .so
+        env:
+          CGO_ENABLED: '1'
+          GOOS: android
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "vaydns-client-android-${{ matrix.android_arch }}.so" ./vaydns-client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vaydns-android-so-${{ matrix.android_arch }}
+          path: vaydns-client-android-*.so
+
   release:
-    needs: build
+    needs: [build, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
