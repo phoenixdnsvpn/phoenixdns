@@ -15,8 +15,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/net2share/vaydns/dns"
-	"github.com/net2share/vaydns/turbotunnel"
+	"github.com/phoenixdnsvpn/phoenixdns/dns"
+	"github.com/phoenixdnsvpn/phoenixdns/turbotunnel"
 )
 
 const (

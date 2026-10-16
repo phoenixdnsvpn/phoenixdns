@@ -71,16 +71,16 @@ jobs:
           fi
           SUFFIX="${{ matrix.suffix }}"
           VERSION="${GITHUB_SHA::7}"
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-client-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-client
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "vaydns-server-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-server
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "phoenixdns-client-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./phoenixdns-client
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "phoenixdns-server-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./phoenixdns-server
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vaydns-${{ matrix.goos }}-${{ matrix.goarch == 'arm' && 'armv7' || matrix.goarch }}
+          name: phoenixdns-${{ matrix.goos }}-${{ matrix.goarch == 'arm' && 'armv7' || matrix.goarch }}
           path: |
-            vaydns-client-*
-            vaydns-server-*
+            phoenixdns-client-*
+            phoenixdns-server-*
           retention-days: 90
 
   e2e:

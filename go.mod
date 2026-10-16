@@ -1,4 +1,4 @@
-module github.com/net2share/vaydns
+module github.com/phoenixdnsvpn/phoenixdns
 
 go 1.24.4
 

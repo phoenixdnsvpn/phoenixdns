@@ -1,8 +1,10 @@
-# VayDNS
+# PhoenixDNS
+
+PhoenixDNS is a high-performance, resilient userspace DNS tunnel. Forked from VayDNS (by net2share) and dnstt (by David Fifield), featuring Yamux stream multiplexing, dynamic multi-record dispatching, and multipath resolver load balancing.
 
 Userspace DNS tunnel with support for DoH, DoT, plaintext UDP, and plaintext TCP.
 
-> VayDNS is a fork of [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield, with protocol optimizations and additional features. The wire protocol differs from upstream dnstt by default, but the `-dnstt-compat` flag enables interoperability with original dnstt clients and servers.
+VayDNS is a fork of [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield, with protocol optimizations and additional features. The wire protocol differs from upstream dnstt by default, but the `-dnstt-compat` flag enables interoperability with original dnstt clients and servers.
 
 ## Features
 
@@ -33,21 +35,21 @@ Userspace DNS tunnel with support for DoH, DoT, plaintext UDP, and plaintext TCP
 '------'  |r                                   '------'
 ```
 
-VayDNS is an application-layer tunnel that runs in userspace. It connects a local TCP port to a remote TCP port by way of a DNS resolver. It does not provide a TUN/TAP interface or a built-in proxy — pair it with a SOCKS or HTTP proxy on the server side.
+PhoenixDNS is an application-layer tunnel that runs in userspace. It connects a local TCP port to a remote TCP port by way of a DNS resolver. It does not provide a TUN/TAP interface or a built-in proxy — pair it with a SOCKS or HTTP proxy on the server side.
 
 ## Quick start
 
 ### 1. Build
 
 ```sh
-go build -o vaydns-server ./vaydns-server
-go build -o vaydns-client ./vaydns-client
+go build -o phoenixdns-server ./phoenixdns-server
+go build -o phoenixdns-client ./phoenixdns-client
 ```
 
 ### 2. Generate keys
 
 ```sh
-./vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
+./phoenixdns-server -gen-key -privkey-file server.key -pubkey-file server.pub
 ```
 
 Copy `server.pub` to the client. Keep `server.key` on the server only.
@@ -55,12 +57,14 @@ Copy `server.pub` to the client. Keep `server.key` on the server only.
 ### 3. Run the server
 
 ```sh
-./vaydns-server -udp :5300 -privkey-file server.key \
+./phoenixdns-server -udp :5300 -privkey-file server.key \
   -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
-./vaydns-server -udp :5300 -privkey-file server.key \
+```sh
+./phoenixdns-server -udp :5300 -privkey-file server.key \
   -record-type txt,caa,null -domain t.example.com -upstream 127.0.0.1:8000
+```
   
 (Note: The -udp flag automatically binds a concurrent TCP listener on the same port to support DNS-over-TCP and truncation fallbacks).
 
@@ -77,35 +81,35 @@ Choose a public resolver. Lists of DoH resolvers: [curl wiki](https://github.com
 Using plaintext UDP (no covertness):
 
 ```sh
-./vaydns-client -udp 8.8.8.8:53 \
+./phoenixdns-client -udp 8.8.8.8:53 \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Using plaintext TCP (bypasses UDP filtering/shaping):
 
 ```sh
-./vaydns-client -tcp 8.8.8.8:53 \
+./phoenixdns-client -tcp 8.8.8.8:53 \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
   
 Using DoH:
 
 ```sh
-./vaydns-client -doh https://doh.example/dns-query \
+./phoenixdns-client -doh https://doh.example/dns-query \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Using DoT:
 
 ```sh
-./vaydns-client -dot dot.example:853 \
+./phoenixdns-client -dot dot.example:853 \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Using multiple resolvers for load balancing and bandwidth aggregation:
 
 ```sh
-./vaydns-client -udp 8.8.8.8:53,1.1.1.1:53 \
+./phoenixdns-client -udp 8.8.8.8:53,1.1.1.1:53 \
   -use-multi-resolver 2 \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
   
@@ -274,17 +278,17 @@ These reduce upstream throughput but improve compatibility. The minimum effectiv
 The client uses [uTLS](https://github.com/refraction-networking/utls) to disguise its TLS fingerprint. The `-utls` flag accepts a comma-separated list of fingerprints, optionally weighted:
 
 ```sh
-./vaydns-client -utls '3*Firefox,2*Chrome,1*iOS' ...
-./vaydns-client -utls Firefox ...
-./vaydns-client -utls random ...   # fully randomized fingerprint
-./vaydns-client -utls none ...     # native Go TLS (less covert, more compatible)
+./phoenixdns-client -utls '3*Firefox,2*Chrome,1*iOS' ...
+./phoenixdns-client -utls Firefox ...
+./phoenixdns-client -utls random ...   # fully randomized fingerprint
+./phoenixdns-client -utls none ...     # native Go TLS (less covert, more compatible)
 ```
 
-Run `./vaydns-client -help` to see all available fingerprint names.
+Run `./phoenixdns-client -help` to see all available fingerprint names.
 
 ## Proxy examples
 
-VayDNS is only a tunnel — pair it with a proxy server for web browsing.
+PhoenixDNS is only a tunnel — pair it with a proxy server for web browsing.
 
 ### HTTP proxy (Ncat)
 
@@ -293,10 +297,10 @@ VayDNS is only a tunnel — pair it with a proxy server for web browsing.
 ```sh
 # Server
 ncat -l -k --proxy-type http 127.0.0.1 8000
-./vaydns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+./phoenixdns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 
 # Client
-./vaydns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+./phoenixdns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 curl --proxy http://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
 
@@ -307,10 +311,10 @@ Server-side SOCKS (accessible to anyone with tunnel access):
 ```sh
 # Server
 ssh -N -D 127.0.0.1:8000 -o NoHostAuthenticationForLocalhost=yes 127.0.0.1
-./vaydns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+./phoenixdns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 
 # Client
-./vaydns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+./phoenixdns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
 
@@ -318,10 +322,10 @@ Client-side SOCKS (private, SSH through the tunnel). Ensure `AllowTcpForwarding 
 
 ```sh
 # Server — forward directly to SSH
-./vaydns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:22
+./phoenixdns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:22
 
 # Client — tunnel SSH, then SOCKS through SSH
-./vaydns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:8000
+./phoenixdns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:8000
 ssh -N -D 127.0.0.1:7000 -o HostKeyAlias=tunnel-server -p 8000 127.0.0.1
 curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 ```
@@ -330,10 +334,10 @@ curl --proxy socks5h://127.0.0.1:7000/ https://wtfismyip.com/text
 
 ```sh
 # Server (ORPort 9001)
-./vaydns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:9001
+./phoenixdns-server -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:9001
 
 # Client
-./vaydns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+./phoenixdns-client -doh https://doh.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 Add to `/etc/tor/torrc` or Tor Browser (`FINGERPRINT` from `/var/lib/tor/fingerprint`):
@@ -368,18 +372,18 @@ An observer at the resolver level can see KCP headers but cannot read yamux fram
 Generate and save keys to files:
 
 ```sh
-./vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
+./phoenixdns-server -gen-key -privkey-file server.key -pubkey-file server.pub
 ```
 
 Or use hex strings directly:
 
 ```sh
-./vaydns-server -gen-key
+./phoenixdns-server -gen-key
 # privkey 0123456789abcdef...
 # pubkey  0000111122223333...
 
-./vaydns-server -udp :5300 -privkey 0123456789abcdef... -domain t.example.com -upstream 127.0.0.1:8000
-./vaydns-client -dot dot.example:853 -pubkey 0000111122223333... -domain t.example.com -listen 127.0.0.1:7000
+./phoenixdns-server -udp :5300 -privkey 0123456789abcdef... -domain t.example.com -upstream 127.0.0.1:8000
+./phoenixdns-client -dot dot.example:853 -pubkey 0000111122223333... -domain t.example.com -listen 127.0.0.1:7000
 ```
 
 If no key is provided, the server generates a temporary keypair on each start.
@@ -399,7 +403,7 @@ Upstream (client → server) payload depends on the domain name length. Shorter 
 Downstream (server → client) payload depends on the transport protocol and UDP response limits. For UDP, the -download-max-mtu flag on the server controls the max payload:
 
 ```sh
-./vaydns-server -download-max-mtu 512 -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
+./phoenixdns-server -download-max-mtu 512 -udp :5300 -privkey-file server.key -domain t.example.com -upstream 127.0.0.1:8000
 ```
 
 - UDP Default: `1232` bytes (safe for most EDNS(0) resolvers)
@@ -410,15 +414,15 @@ Both client and server log their effective MTU at startup. The server's effectiv
 
 ## dnstt compatibility
 
-By default, VayDNS uses a leaner wire protocol than dnstt (2-byte ClientID, no padding). The `-dnstt-compat` flag restores the original dnstt format on both client and server, enabling interoperability with upstream dnstt binaries.
+By default, PhoenixDNS uses a leaner wire protocol than dnstt (2-byte ClientID, no padding). The `-dnstt-compat` flag restores the original dnstt format on both client and server, enabling interoperability with upstream dnstt binaries.
 
 ```sh
-# VayDNS server accepting connections from original dnstt clients
-./vaydns-server -udp :5300 -dnstt-compat -privkey-file server.key \
+# PhoenixDNS server accepting connections from original dnstt clients
+./phoenixdns-server -udp :5300 -dnstt-compat -privkey-file server.key \
   -domain t.example.com -upstream 127.0.0.1:8000
 
-# VayDNS client connecting to an original dnstt server
-./vaydns-client -doh https://doh.example/dns-query -dnstt-compat \
+# PhoenixDNS client connecting to an original dnstt server
+./phoenixdns-client -doh https://doh.example/dns-query -dnstt-compat \
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
@@ -430,7 +434,7 @@ The `-clientid-size` flag allows setting a custom ClientID size (e.g. 4 bytes) w
 
 On both client and server, `-dnstt-compat` switches to the original dnstt wire format (8-byte ClientID, padding prefixes) and overrides the following defaults to match dnstt's values:
 
-| Setting | VayDNS default | With `-dnstt-compat` | Applies to |
+| Setting | PhoenixDNS default | With `-dnstt-compat` | Applies to |
 | ------- | -------------- | -------------------- | ---------- |
 | `-max-qname-len` | `101` | `253` | client |
 | `-idle-timeout` | `10s` | `2m` | client and server |
@@ -444,7 +448,7 @@ All three can be explicitly overridden even when `-dnstt-compat` is set — the 
 
 ### Record types
 
-VayDNS supports multiple DNS record types for downstream data encoding. The server can enable multiple record types simultaneously using a comma-separated list (e.g. `-record-type txt,caa,null`) or `-record-type all`. Clients can query using any supported record type without requiring rigid 1:1 configuration synchronization with the server.
+PhoenixDNS supports multiple DNS record types for downstream data encoding. The server can enable multiple record types simultaneously using a comma-separated list (e.g. `-record-type txt,caa,null`) or `-record-type all`. Clients can query using any supported record type without requiring rigid 1:1 configuration synchronization with the server.
 
 | Type | Description | Capacity |
 | ---- | ----------- | -------- |
@@ -462,7 +466,7 @@ VayDNS supports multiple DNS record types for downstream data encoding. The serv
 
 ### Wire protocol differences
 
-| Aspect | VayDNS (default) | dnstt / `-dnstt-compat` |
+| Aspect | PhoenixDNS (default) | dnstt / `-dnstt-compat` |
 | ------ | ---------------- | ----------------------- |
 | ClientID | 2 bytes | 8 bytes |
 | Data packet | `[ClientID][DataLen:1][Data]` | `[ClientID][224+3][Padding:3][DataLen:1][Data]` |
@@ -471,7 +475,7 @@ VayDNS supports multiple DNS record types for downstream data encoding. The serv
 
 ## Client library
 
-The `client` package (`github.com/net2share/vaydns/client`) provides a reusable Go library for embedding VayDNS in other applications. See [docs/client-library.md](docs/client-library.md) for usage and examples.
+The `client` package (`github.com/phoenixdnsvpn/phoenixdns/client`) provides a reusable Go library for embedding PhoenixDNS in other applications. See [docs/client-library.md](docs/client-library.md) for usage and examples.
 
 ## E2E tests
 
@@ -490,4 +494,6 @@ bash e2e/recovery/run.sh         # server crash recovery
 
 ## License
 
+PhoenixDNS is a fork of [vaydns](https://github.com/net2share/vaydns/) by net2share. The original vaydns is public domain.
 VayDNS is a fork of [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield. The original dnstt is public domain.
+

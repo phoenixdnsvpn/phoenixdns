@@ -51,16 +51,16 @@ jobs:
           SUFFIX="${{ matrix.suffix }}"
           VERSION="${GITHUB_REF_NAME#v}"
           go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
-            -o "vaydns-client-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-client
+            -o "phoenixdns-client-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./phoenixdns-client
           go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
-            -o "vaydns-server-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./vaydns-server
+            -o "phoenixdns-server-${{ matrix.goos }}-${ARCH}${SUFFIX}" ./phoenixdns-server
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vaydns-${{ matrix.goos }}-${{ matrix.goarch == 'arm' && 'armv7' || matrix.goarch }}
+          name: phoenixdns-${{ matrix.goos }}-${{ matrix.goarch == 'arm' && 'armv7' || matrix.goarch }}
           path: |
-            vaydns-client-*
-            vaydns-server-*
+            phoenixdns-client-*
+            phoenixdns-server-*
 
   build-android:
     runs-on: ubuntu-latest
@@ -106,12 +106,12 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
-            -o "vaydns-client-android-${{ matrix.android_arch }}.so" ./vaydns-client
+            -o "phoenixdns-client-android-${{ matrix.android_arch }}.so" ./phoenixdns-client
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vaydns-android-so-${{ matrix.android_arch }}
-          path: vaydns-client-android-*.so
+          name: phoenixdns-android-so-${{ matrix.android_arch }}
+          path: phoenixdns-client-android-*.so
 
   release:
     needs: [build, build-android]
@@ -120,14 +120,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: vaydns-*
+          pattern: phoenixdns-*
 
       - name: Prepare files
         run: |
           mkdir -p release
-          find artifacts -type f \( -name 'vaydns-client-*' -o -name 'vaydns-server-*' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name 'phoenixdns-client-*' -o -name 'phoenixdns-server-*' \) -exec cp {} release/ \;
           cd release
-          for f in vaydns-*; do sha256sum "$f" > "$f.sha256"; done
+          for f in phoenixdns-*; do sha256sum "$f" > "$f.sha256"; done
 
       - name: Create Release and upload assets
         env:

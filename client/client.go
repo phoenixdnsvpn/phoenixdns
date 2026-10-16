@@ -34,9 +34,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/net2share/vaydns/dns"
-	"github.com/net2share/vaydns/noise"
-	"github.com/net2share/vaydns/turbotunnel"
+	"github.com/phoenixdnsvpn/phoenixdns/dns"
+	"github.com/phoenixdnsvpn/phoenixdns/noise"
+	"github.com/phoenixdnsvpn/phoenixdns/turbotunnel"
 	utls "github.com/refraction-networking/utls"
 	log "github.com/sirupsen/logrus"
 	"github.com/xtaci/kcp-go/v5"

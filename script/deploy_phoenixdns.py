@@ -57,8 +57,8 @@ def detect_remote_arch(ssh, user, password):
     return "amd64"
 
 def get_current_vaydns_params(ssh, user, password):
-    """Fetches and parses the current vaydns-server.service parameters."""
-    _, out, _ = run_cmd(ssh, "cat /etc/systemd/system/vaydns-server.service || true", user, password, hide_output=True)
+    """Fetches and parses the current phoenixdns-server.service parameters."""
+    _, out, _ = run_cmd(ssh, "cat /etc/systemd/system/phoenixdns-server.service || true", user, password, hide_output=True)
     
     params = {
         'domain': '',
@@ -106,27 +106,27 @@ def get_current_vaydns_params(ssh, user, password):
     return params
 
 def uninstall_vaydns(ssh, user, password, is_ubuntu, dante_service):
-    """Handles complete removal of VayDNS services, binaries, and firewall rules."""
+    """Handles complete removal of PhoenixDNS services, binaries, and firewall rules."""
     print("===================================================================")
     print("                  UNINSTALLATION PROCESS")
     print("===================================================================")
     
-    remove_user_input = input("Do you want to delete the 'vaydns' and proxy system users? (y/N) [default: no]: ").strip().lower()
+    remove_user_input = input("Do you want to delete the 'phoenixdns' and proxy system users? (y/N) [default: no]: ").strip().lower()
     remove_user = remove_user_input in ['y', 'yes']
 
-    print_step("Stopping and disabling VayDNS and Proxy services")
-    run_cmd(ssh, "systemctl stop vaydns-server danted sockd shadowsocks || true", user, password)
-    run_cmd(ssh, "systemctl disable vaydns-server danted sockd shadowsocks || true", user, password)
+    print_step("Stopping and disabling PhoenixDNS and Proxy services")
+    run_cmd(ssh, "systemctl stop phoenixdns-server danted sockd shadowsocks || true", user, password)
+    run_cmd(ssh, "systemctl disable phoenixdns-server danted sockd shadowsocks || true", user, password)
 
     print_step("Removing systemd service files, binaries, and configurations")
-    run_cmd(ssh, "rm -f /etc/systemd/system/vaydns-server.service /etc/systemd/system/shadowsocks.service", user, password)
+    run_cmd(ssh, "rm -f /etc/systemd/system/phoenixdns-server.service /etc/systemd/system/shadowsocks.service", user, password)
     run_cmd(ssh, "systemctl daemon-reload", user, password)
-    run_cmd(ssh, "rm -rf /etc/vaydns /etc/shadowsocks", user, password)
-    run_cmd(ssh, "rm -f /usr/local/bin/vaydns-server /usr/local/bin/ssserver", user, password)
+    run_cmd(ssh, "rm -rf /etc/phoenixdns /etc/shadowsocks", user, password)
+    run_cmd(ssh, "rm -f /usr/local/bin/phoenixdns-server /usr/local/bin/ssserver", user, password)
 
     if remove_user:
         print_step("Deleting system users")
-        run_cmd(ssh, "userdel vaydns || true", user, password)
+        run_cmd(ssh, "userdel phoenixdns || true", user, password)
         run_cmd(ssh, "userdel proxyuser || true", user, password)
         run_cmd(ssh, "userdel -r sshproxy || true", user, password)
         print("[+] Users removed.")
@@ -146,7 +146,7 @@ def uninstall_vaydns(ssh, user, password, is_ubuntu, dante_service):
         print("[+] Removed firewalld UDP/TCP 53 port redirections.")
 
     print("\n===================================================================")
-    print("✅ VayDNS and all associated proxies have been successfully uninstalled!")
+    print("✅ PhoenixDNS and all associated proxies have been successfully uninstalled!")
     print("ℹ️  Note: SSH configurations and ports were untouched.")
     print("===================================================================")
 
@@ -196,7 +196,7 @@ def update_vaydns(ssh, user, password, is_ubuntu, dante_service, dante_config_pa
     keepalive = input(f"Keepalive [default: {def_ka}]: ").strip() or def_ka
     
     c_vp = curr_params['vaydns_port']
-    vaydns_port = input(f"VayDNS port [default: {c_vp}]: ").strip() or c_vp
+    vaydns_port = input(f"PhoenixDNS port [default: {c_vp}]: ").strip() or c_vp
     
     c_up = curr_params['upstream_port']
     upstream_port = input(f"Upstream Proxy Port (e.g. 8000 for Dante, 8388 for SS) [default: {c_up}]: ").strip() or c_up
@@ -209,49 +209,49 @@ def update_vaydns(ssh, user, password, is_ubuntu, dante_service, dante_config_pa
     except ValueError:
         mtu = "1232"
     
-    update_bin = input("Update vaydns-server binary to latest release from GitHub? (y/N) [default: no]: ").strip().lower() in ['y', 'yes']
+    update_bin = input("Update phoenixdns-server binary to latest release from GitHub? (y/N) [default: no]: ").strip().lower() in ['y', 'yes']
     if update_bin:
         arch = detect_remote_arch(ssh, user, password)
         print_step(f"Downloading latest binary (linux-{arch})")
-        bin_url = f"https://github.com/phoenixdnsvpn/vaydns/releases/latest/download/vaydns-server-linux-{arch}"
+        bin_url = f"https://github.com/phoenixdnsvpn/phoenixdns/releases/latest/download/phoenixdns-server-linux-{arch}"
         update_cmd = f"""
         cd /tmp
-        rm -f vaydns-server
-        curl -sLf "{bin_url}" -o vaydns-server
-        chmod 755 vaydns-server
-        mv vaydns-server /usr/local/bin/vaydns-server
+        rm -f phoenixdns-server
+        curl -sLf "{bin_url}" -o phoenixdns-server
+        chmod 755 phoenixdns-server
+        mv phoenixdns-server /usr/local/bin/phoenixdns-server
         """
         run_cmd(ssh, update_cmd, user, password)
         if not is_ubuntu:
-            run_cmd(ssh, "restorecon -v /usr/local/bin/vaydns-server", user, password)
-        print("[+] vaydns-server binary updated successfully.")
+            run_cmd(ssh, "restorecon -v /usr/local/bin/phoenixdns-server", user, password)
+        print("[+] phoenixdns-server binary updated successfully.")
 
     gen_keys = input("Generate new key pairs? (y/N) [default: no]: ").strip().lower() in ['y', 'yes']
     if gen_keys:
         print_step("Generating new cryptographic keys")
-        cmd = "rm -f /etc/vaydns/server.key /etc/vaydns/server.pub && /usr/local/bin/vaydns-server -gen-key -privkey-file /etc/vaydns/server.key -pubkey-file /etc/vaydns/server.pub && chown -R vaydns:vaydns /etc/vaydns"
+        cmd = "rm -f /etc/phoenixdns/server.key /etc/phoenixdns/server.pub && /usr/local/bin/phoenixdns-server -gen-key -privkey-file /etc/phoenixdns/server.key -pubkey-file /etc/phoenixdns/server.pub && chown -R phoenixdns:phoenixdns /etc/phoenixdns"
         run_cmd(ssh, cmd, user, password)
         print("[+] New keys generated successfully.")
 
-    print_step("Checking if VayDNS service is currently running")
-    _, check_active, _ = run_cmd(ssh, "systemctl is-active vaydns-server || true", user, password, hide_output=True)
+    print_step("Checking if PhoenixDNS service is currently running")
+    _, check_active, _ = run_cmd(ssh, "systemctl is-active phoenixdns-server || true", user, password, hide_output=True)
     if check_active.strip() == "active":
-        print("[*] VayDNS service is active. Stopping it before applying updates...")
-        run_cmd(ssh, "systemctl stop vaydns-server", user, password)
+        print("[*] PhoenixDNS service is active. Stopping it before applying updates...")
+        run_cmd(ssh, "systemctl stop phoenixdns-server", user, password)
 
     print_step("Updating Systemd Service Parameters")
     vaydns_service_content = f"""[Unit]
-Description=VayDNS Tunnel Server
+Description=PhoenixDNS Tunnel Server
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-User=vaydns
-Group=vaydns
+User=phoenixdns
+Group=phoenixdns
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/vaydns-server -udp :{vaydns_port} -privkey-file /etc/vaydns/server.key -download-max-mtu {mtu} -record-type {record_type} {dnstt_flag}-idle-timeout {idle_timeout} -keepalive {keepalive} -domain {domain} -upstream 127.0.0.1:{upstream_port}
+ExecStart=/usr/local/bin/phoenixdns-server -udp :{vaydns_port} -privkey-file /etc/phoenixdns/server.key -download-max-mtu {mtu} -record-type {record_type} {dnstt_flag}-idle-timeout {idle_timeout} -keepalive {keepalive} -domain {domain} -upstream 127.0.0.1:{upstream_port}
 Restart=always
 RestartSec=5
 KillMode=mixed
@@ -262,7 +262,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/
-ReadWritePaths=/etc/vaydns
+ReadWritePaths=/etc/phoenixdns
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -270,7 +270,7 @@ ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target"""
-    write_file_remote(ssh, "/etc/systemd/system/vaydns-server.service", vaydns_service_content, user, password)
+    write_file_remote(ssh, "/etc/systemd/system/phoenixdns-server.service", vaydns_service_content, user, password)
 
     if upstream_port == "8000":
         print_step("Updating Dante Proxy Configuration")
@@ -309,12 +309,12 @@ socks pass {{
         run_cmd(ssh, f"firewall-cmd --permanent --add-forward-port=port=53:proto=tcp:toport={vaydns_port}", user, password)
         run_cmd(ssh, "firewall-cmd --reload", user, password)
 
-    print_step("Restarting VayDNS Service")
+    print_step("Restarting PhoenixDNS Service")
     run_cmd(ssh, "systemctl daemon-reload", user, password)
-    run_cmd(ssh, "systemctl start vaydns-server", user, password)
+    run_cmd(ssh, "systemctl start phoenixdns-server", user, password)
 
     print_step("Fetching Updated Keys and Generating Links")
-    _, pubkey_raw, _ = run_cmd(ssh, "cat /etc/vaydns/server.pub", user, password, hide_output=True)
+    _, pubkey_raw, _ = run_cmd(ssh, "cat /etc/phoenixdns/server.pub", user, password, hide_output=True)
     pubkey = pubkey_raw.strip()
 
     print("\n✅ CONFIGURATION UPDATE SUCCESSFUL!")
@@ -326,17 +326,17 @@ socks pass {{
     
     for d in domains_list:
         for rt in record_types_list:
-            client_config_url = f"dnst://{d}/vaydns/socks5?pubkey={pubkey}&record-type={rt}&clientid-size=2&keepalive={keepalive}&idle-timeout={idle_timeout}&dnstt-compat={dnstt_url_flag}#vaydns-{rt}"
+            client_config_url = f"dnst://{d}/phoenixdns/socks5?pubkey={pubkey}&record-type={rt}&clientid-size=2&keepalive={keepalive}&idle-timeout={idle_timeout}&dnstt-compat={dnstt_url_flag}#phoenixdns-{rt}"
             print(client_config_url)
 
 def main():
     print("===================================================================")
-    print("         VayDNS Server Cross-Platform Management Script")
+    print("         PhoenixDNS Server Cross-Platform Management Script")
     print("===================================================================")
     print("Select Action:")
-    print("1. Install / Deploy VayDNS Server")
-    print("2. Uninstall VayDNS Server")
-    print("3. Update VayDNS Configuration")
+    print("1. Install / Deploy PhoenixDNS Server")
+    print("2. Uninstall PhoenixDNS Server")
+    print("3. Update PhoenixDNS Configuration")
     print("===================================================================")
     
     action_choice = input("Select an option (1/2/3) [default: 1]: ").strip()
@@ -572,7 +572,7 @@ def main():
         if current_ssh_port != new_ssh_port:
             run_cmd(ssh, f"iptables -A INPUT -p tcp --dport {new_ssh_port} -j ACCEPT", user, password)
             
-        # Accept redirected VayDNS traffic and redirect UDP/TCP port 53
+        # Accept redirected PhoenixDNS traffic and redirect UDP/TCP port 53
         run_cmd(ssh, "iptables -A INPUT -p udp --dport 5300 -j ACCEPT", user, password)
         run_cmd(ssh, "iptables -A INPUT -p tcp --dport 5300 -j ACCEPT", user, password)
         run_cmd(ssh, "iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300", user, password)
@@ -603,7 +603,7 @@ def main():
 
     # 3. Create Service User
     print_step("Validating and creating system service accounts")
-    run_cmd(ssh, "id -u vaydns &>/dev/null || useradd -r -M -s /bin/false -c 'vaydns service user' -d /nonexistent vaydns", user, password)
+    run_cmd(ssh, "id -u phoenixdns &>/dev/null || useradd -r -M -s /bin/false -c 'phoenixdns service user' -d /nonexistent phoenixdns", user, password)
 
     # Configure Passwordless SSH
     if pub_key_content:
@@ -615,20 +615,20 @@ def main():
 
     # 4. Download Release Binary & Generate Keys
     arch = detect_remote_arch(ssh, user, password)
-    print_step(f"Downloading latest vaydns-server binary for linux-{arch} from GitHub")
-    binary_url = f"https://github.com/phoenixdnsvpn/vaydns/releases/latest/download/vaydns-server-linux-{arch}"
+    print_step(f"Downloading latest phoenixdns-server binary for linux-{arch} from GitHub")
+    binary_url = f"https://github.com/phoenixdnsvpn/phoenixdns/releases/latest/download/phoenixdns-server-linux-{arch}"
     
     setup_cmds = f"""
     cd /tmp
-    rm -f vaydns-server
-    curl -sLf "{binary_url}" -o vaydns-server
-    chmod +x vaydns-server
-    ./vaydns-server -gen-key -privkey-file server.key -pubkey-file server.pub
-    mkdir -p /etc/vaydns
-    mv server.key server.pub /etc/vaydns/
-    chown -R vaydns:vaydns /etc/vaydns
-    mv vaydns-server /usr/local/bin/
-    chmod 755 /usr/local/bin/vaydns-server
+    rm -f phoenixdns-server
+    curl -sLf "{binary_url}" -o phoenixdns-server
+    chmod +x phoenixdns-server
+    ./phoenixdns-server -gen-key -privkey-file server.key -pubkey-file server.pub
+    mkdir -p /etc/phoenixdns
+    mv server.key server.pub /etc/phoenixdns/
+    chown -R phoenixdns:phoenixdns /etc/phoenixdns
+    mv phoenixdns-server /usr/local/bin/
+    chmod 755 /usr/local/bin/phoenixdns-server
     """
     exit_code, _, err = run_cmd(ssh, setup_cmds, user, password)
     if exit_code != 0:
@@ -638,8 +638,8 @@ def main():
 
     if not is_ubuntu:
         print_step("Applying target SELinux security context rules")
-        run_cmd(ssh, 'semanage fcontext -a -t bin_t "/usr/local/bin/vaydns-server"', user, password)
-        run_cmd(ssh, "restorecon -v /usr/local/bin/vaydns-server", user, password)
+        run_cmd(ssh, 'semanage fcontext -a -t bin_t "/usr/local/bin/phoenixdns-server"', user, password)
+        run_cmd(ssh, "restorecon -v /usr/local/bin/phoenixdns-server", user, password)
 
     # =====================================================================
     # AUTHENTICATION PROTOCOL SETUP
@@ -742,25 +742,25 @@ WantedBy=multi-user.target"""
         run_cmd(ssh, "systemctl daemon-reload && systemctl enable --now shadowsocks", user, password)
 
     # 5. Create SystemD Service
-    print_step("Checking for existing VayDNS service")
-    _, check_active, _ = run_cmd(ssh, "systemctl is-active vaydns-server || true", user, password, hide_output=True)
+    print_step("Checking for existing PhoenixDNS service")
+    _, check_active, _ = run_cmd(ssh, "systemctl is-active phoenixdns-server || true", user, password, hide_output=True)
     if check_active.strip() == "active":
-        print("[*] VayDNS service is currently running. Stopping it before applying updates...")
-        run_cmd(ssh, "systemctl stop vaydns-server", user, password)
+        print("[*] PhoenixDNS service is currently running. Stopping it before applying updates...")
+        run_cmd(ssh, "systemctl stop phoenixdns-server", user, password)
 
     print_step("Writing systemd architectural service blocks")
     vaydns_service_content = f"""[Unit]
-Description=VayDNS Tunnel Server
+Description=PhoenixDNS Tunnel Server
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-User=vaydns
-Group=vaydns
+User=phoenixdns
+Group=phoenixdns
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/vaydns-server -udp :{vaydns_port} -privkey-file /etc/vaydns/server.key -download-max-mtu {mtu} -record-type {record_type} {dnstt_flag}-idle-timeout {idle_timeout} -keepalive {keepalive} -domain {domain} -upstream 127.0.0.1:{upstream_port}
+ExecStart=/usr/local/bin/phoenixdns-server -udp :{vaydns_port} -privkey-file /etc/phoenixdns/server.key -download-max-mtu {mtu} -record-type {record_type} {dnstt_flag}-idle-timeout {idle_timeout} -keepalive {keepalive} -domain {domain} -upstream 127.0.0.1:{upstream_port}
 Restart=always
 RestartSec=5
 KillMode=mixed
@@ -771,7 +771,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/
-ReadWritePaths=/etc/vaydns
+ReadWritePaths=/etc/phoenixdns
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -780,12 +780,12 @@ ProtectControlGroups=true
 [Install]
 WantedBy=multi-user.target"""
     
-    write_file_remote(ssh, "/etc/systemd/system/vaydns-server.service", vaydns_service_content, user, password)
+    write_file_remote(ssh, "/etc/systemd/system/phoenixdns-server.service", vaydns_service_content, user, password)
     
-    print_step("Booting up and enabling VayDNS core tunnel infrastructure")
+    print_step("Booting up and enabling PhoenixDNS core tunnel infrastructure")
     run_cmd(ssh, "systemctl daemon-reload", user, password)
-    run_cmd(ssh, "systemctl start vaydns-server", user, password)
-    run_cmd(ssh, "systemctl enable vaydns-server", user, password)
+    run_cmd(ssh, "systemctl start phoenixdns-server", user, password)
+    run_cmd(ssh, "systemctl enable phoenixdns-server", user, password)
 
     print_step("Booting up and enabling vnstat for traffic monitoring")
     run_cmd(ssh, "systemctl start vnstat", user, password)
@@ -830,10 +830,10 @@ WantedBy=multi-user.target"""
     
     # 9. Retrieve Data
     print_step("Fetching generation keys and diagnostics reports from deployment")
-    _, pubkey_raw, _ = run_cmd(ssh, "cat /etc/vaydns/server.pub", user, password, hide_output=True)
+    _, pubkey_raw, _ = run_cmd(ssh, "cat /etc/phoenixdns/server.pub", user, password, hide_output=True)
     pubkey = pubkey_raw.strip()
     
-    _, status_out, _ = run_cmd(ssh, "systemctl status vaydns-server --no-pager", user, password, hide_output=True)
+    _, status_out, _ = run_cmd(ssh, "systemctl status phoenixdns-server --no-pager", user, password, hide_output=True)
     
     ssh.close()
 
@@ -882,11 +882,11 @@ WantedBy=multi-user.target"""
     
     for d in domains_list:
         for rt in record_types_list:
-            client_config_url = f"dnst://{d}/vaydns/{backend_slug}?pubkey={pubkey}&record-type={rt}&clientid-size=2&keepalive={keepalive}&idle-timeout={idle_timeout}&dnstt-compat={dnstt_url_flag}#vaydns-{rt}"
+            client_config_url = f"dnst://{d}/phoenixdns/{backend_slug}?pubkey={pubkey}&record-type={rt}&clientid-size=2&keepalive={keepalive}&idle-timeout={idle_timeout}&dnstt-compat={dnstt_url_flag}#phoenixdns-{rt}"
             print(client_config_url)
 
     print("\nImport Method:")
-    print("1. Launch VayDNS Android.")
+    print("1. Launch PhoenixDNS Android.")
     print("2. Open context operations menu (top-right dashboard).")
     print("3. Choose 'Import' and commit these string layouts onto your configuration profile engine.")
 

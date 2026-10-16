@@ -17,10 +17,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/net2share/vaydns/client"
-	"github.com/net2share/vaydns/dns"
-	"github.com/net2share/vaydns/noise"
-	"github.com/net2share/vaydns/turbotunnel"
+	"github.com/phoenixdnsvpn/phoenixdns/client"
+	"github.com/phoenixdnsvpn/phoenixdns/dns"
+	"github.com/phoenixdnsvpn/phoenixdns/noise"
+	"github.com/phoenixdnsvpn/phoenixdns/turbotunnel"
 	log "github.com/sirupsen/logrus"
 )
 

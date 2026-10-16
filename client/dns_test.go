@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/net2share/vaydns/dns"
+	"github.com/phoenixdnsvpn/phoenixdns/dns"
 )
 
 func allPackets(buf []byte) ([][]byte, error) {
