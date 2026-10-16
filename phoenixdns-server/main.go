@@ -1400,6 +1400,7 @@ func main() {
 	var queueSize int
 	var kcpWindowSize int
 	var queueOverflowStr string
+	var disableTCP bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
