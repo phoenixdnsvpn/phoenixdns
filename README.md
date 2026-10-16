@@ -174,9 +174,10 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-p
 | `-upload-max-mtu N`  | Maximum upload MTU (for client parity)                            | `140`      |
 | `-download-min-mtu N`  | Minimum download MTU (for client parity)                        | `200`      |
 | `-download-max-mtu N`  | Maximum size of DNS responses (TCP is uncapped)                 | `1232`     |
-| `-idle-timeout D`    | Session idle timeout (must match client)                          | `10s`      |
-| `-keepalive D`       | Keepalive ping interval (must match client, must be < idle-timeout) | `2s`      |
+| `-idle-timeout D`    | Session idle timeout (must match client)                          | `120s`     |
+| `-keepalive D`       | Keepalive ping interval (must match client, must be < idle-timeout) | `10s`    |
 | `-fallback ADDR`     | UDP endpoint to forward non-DNS packets to (e.g. `127.0.0.1:8888`) | —          |
+| `-disable-tcp`       | disable concurrent TCP listener                                   |  —         |
 | `-dnstt-compat`      | Use original dnstt wire format (8-byte ClientID, padding prefixes). Also sets `-idle-timeout` to 2m and `-keepalive` to 10s unless explicitly overridden. | `false`    |
 | `-clientid-size N`   | ClientID size in bytes (ignored when `-dnstt-compat` is set)       | `2`        |
 | `-record-type TYPE`  | DNS record type for downstream data: comma-separated (e.g. txt,caa,null). `txt`, `null`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`, `caa`. Clients can query using any of the enabled types. Ignored (forced to `txt`) when `-dnstt-compat` is set. | `txt`      |
@@ -184,6 +185,8 @@ sudo ip6tables -t nat -I PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-p
 | `-kcp-window-size N` | KCP send/receive window size in packets (0 = queue-size/2)        | `0`        |
 | `-queue-overflow MODE` | Queue overflow behavior: `drop` (silent discard) or `block` (backpressure) | `drop`     |
 | `-log-level LEVEL`   | Log level: debug, info, warning, error                            | `info`     |
+
+> **Note:** if you add `-disable-tcp` in server flags, you must ensure the `-download-max-mtu` in server and client is <= 1232
 
 ### Client flags
 
