@@ -1,3 +1,11 @@
+> 📢 **IMPORTANT ANNOUNCEMENT: REBRANDING TO PHOENIXDNS**
+> 
+> This project has officially evolved and rebranded from **VayDNS** to **PhoenixDNS**. 
+>
+> In our pursuit of tunnel stability, we recently overhauled the core architecture by replacing the legacy `smux` stream multiplexer with HashiCorp's `yamux`. This critical upgrade eliminated TCP backpressure bottlenecks and allowed us to establish highly resilient 120-second timeouts, allowing connections to survive severe network drops. 
+> 
+> Because this architectural upgrade fundamentally alters the wire protocol, **this engine is no longer backward compatible with original VayDNS or dnstt clients.** To avoid versioning confusion and to accurately reflect the massive feature divergence of this fork—which now includes multipath load balancing, dynamic MTU probing, and flexible multi-record dispatching—we are moving forward as a standalone protocol under the name **PhoenixDNS**.
+
 # PhoenixDNS
 
 PhoenixDNS is a high-performance, resilient userspace DNS tunnel. Forked from VayDNS (by net2share) and dnstt (by David Fifield), featuring Yamux stream multiplexing, dynamic multi-record dispatching, and multipath resolver load balancing.
