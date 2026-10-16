@@ -7,6 +7,7 @@ Userspace DNS tunnel with support for DoH, DoT, plaintext UDP, and plaintext TCP
 ## Features
 
 - **Multiple transports** — Multiple transports — DNS over HTTPS (DoH), DNS over TLS (DoT), plaintext UDP, and DNS-over-TCP.
+- **Multipath Load Balancing** — Supply a comma-separated list of resolvers to instantly aggregate bandwidth and spread the query load across multiple independent tunnels, evading DNS rate limits and DDoS mitigation triggers.
 - **Dynamic MTU Discovery** — Actively probes network boundaries to automatically negotiate the maximum safe payload size without manual configuration.
 - **Concurrent TCP & UDP Listener** — The server seamlessly handles both UDP and TCP DNS queries simultaneously on the same port.
 - **UDP Truncation Fallback (TC Flag)** — Automatically sets the TC (Truncation) flag for oversized UDP payloads, seamlessly prompting the client to retry the query over TCP.
@@ -97,6 +98,13 @@ Using DoT:
   -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
 ```
 
+Using multiple resolvers for load balancing and bandwidth aggregation:
+
+```sh
+./vaydns-client -udp 8.8.8.8:53,1.1.1.1:53 \
+  -use-multi-resolver 2 \
+  -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+  
 ### 5. Test
 
 ```sh
@@ -249,6 +257,7 @@ These reduce upstream throughput but improve compatibility. The minimum effectiv
 
 | Flag               | Description                                                | Default         |
 | ------------------ | ---------------------------------------------------------- | --------------- |
+| `-use-multi-resolver N` | Number of resolvers to use for multi-path load balancing (1-4). If N=1, uses native racing logic (fastest wins). If N>1, boots independent background tunnels and distributes traffic evenly via round-robin. | `3` |
 | `-rps N`           | Rate limit outgoing DNS queries per second (0 = unlimited). Uses a token bucket with 1-second burst allowance. | `0`             |
 | `-dnstt-compat`    | Use original dnstt wire format (8-byte ClientID, padding prefixes). Sets `-max-qname-len` to 253 unless explicitly overridden. Forces `-record-type` to `txt` with a warning if another type is set. | `false`         |
 | `-clientid-size N` | ClientID size in bytes (ignored when `-dnstt-compat` is set) | `2`             |
