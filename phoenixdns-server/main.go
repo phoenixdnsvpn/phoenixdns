@@ -1371,7 +1371,10 @@ func run(privkey []byte, domains []dns.Name, upstream string, dnsConn net.Packet
 	}()
 
 	// Start concurrent TCP listener
-	go tcpAcceptLoop(domains, tcpListener, ttConn, ch, stats, wireConfig)
+	// Start concurrent TCP listener if enabled
+	if tcpListener != nil {
+		go tcpAcceptLoop(domains, tcpListener, ttConn, ch, stats, wireConfig)
+	}
 
 	return udpRecvLoop(domains, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
 
@@ -1423,6 +1426,7 @@ Example:
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
+	flag.BoolVar(&disableTCP, "disable-tcp", false, "disable concurrent TCP listener")
 	flag.StringVar(&fallbackAddrString, "fallback", "", "UDP endpoint to forward non-DNS packets to (e.g., 127.0.0.1:8888)")
 	flag.StringVar(&domainArg, "domain", "", "tunnel domain (e.g., t.example.com)")
 	flag.StringVar(&upstream, "upstream", "", "TCP address to forward tunneled connections to (e.g., 127.0.0.1:8000)")
@@ -1568,10 +1572,13 @@ Example:
 		}
 
 		// Start TCP listener on the exact same port
-		tcpListener, err := net.Listen("tcp", udpAddr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "opening TCP listener: %v\n", err)
-			os.Exit(1)
+		var tcpListener net.Listener
+		if !disableTCP {
+			tcpListener, err = net.Listen("tcp", udpAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "opening TCP listener: %v\n", err)
+				os.Exit(1)
+			}
 		}
 		
 		var fallbackAddr *net.UDPAddr
