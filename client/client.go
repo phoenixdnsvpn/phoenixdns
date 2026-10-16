@@ -28,7 +28,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -538,7 +540,7 @@ func (t *Tunnel) InitiateKCPConn(mtu int) error {
 	if mtu <= 0 {
 		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
 			mtu = t.TunnelServer.UploadMaxMTU 
-			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
+			log.Infof("[MTU Discovery]: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
 		} else {
 			var err error
 			mtu, err = t.DiscoverMTU()
@@ -812,7 +814,7 @@ func (t *Tunnel) ListenAndServe(listenAddr string) error {
 	if t.MaxStreams > 0 {
 		sem = make(chan struct{}, t.MaxStreams)
 	}
-
+				
 	for {
 		// Rebuild the transport stack from the resolver upward.
 		var transportErrCh <-chan error
@@ -925,7 +927,7 @@ func (t *Tunnel) createSession(mtu int) (*kcp.UDPSession, *yamux.Session, error)
 	if mtu <= 0 {
 		if t.Resolver.ResolverType == ResolverTypeTCP || t.Resolver.ResolverType == ResolverTypeDOT || t.Resolver.ResolverType == ResolverTypeDOH {
 			mtu = t.TunnelServer.UploadMaxMTU
-			log.Infof("VAY_DEBUG: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
+			log.Infof("[MTU Discovery]: Stream transport detected. Bypassing MTU discovery and locking to %d", mtu)
 		} else {
 			var err error
 			mtu, err = t.DiscoverMTU()
@@ -1107,17 +1109,115 @@ func NewOutbound(resolvers []Resolver, tunnelServers []TunnelServer) *Outbound {
 	}
 }
 
-// Start begins accepting connections on bind and forwarding them through the
-// first resolver/server pair.
+// Start begins accepting connections on bind and forwards them through 
+// all provided resolvers. It auto-detects Single vs Load-Balanced modes.
 func (o *Outbound) Start(bind string) error {
-	resolver := o.Resolvers[0]
+	if len(o.Resolvers) == 0 || len(o.TunnelServers) == 0 {
+		return fmt.Errorf("no resolvers or tunnel servers provided")
+	}
+
 	tunnelServer := o.TunnelServers[0]
 
-	tunnel, err := NewTunnel(resolver, tunnelServer)
-	if err != nil {
-		return fmt.Errorf("failed to create tunnel: %w", err)
+	// 1. Expand resolvers in case ResolverAddr contains comma-separated values
+	var expandedResolvers []Resolver
+	for _, r := range o.Resolvers {
+		parts := strings.Split(r.ResolverAddr, ",")
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				rClone := r
+				rClone.ResolverAddr = p
+				expandedResolvers = append(expandedResolvers, rClone)
+			}
+		}
 	}
-	o.tunnels = []*Tunnel{tunnel}
 
-	return tunnel.ListenAndServe(bind)
+	if len(expandedResolvers) == 0 {
+		return fmt.Errorf("no valid resolver addresses found")
+	}
+
+	// =========================================================
+	// PATH A: SINGLE RESOLVER (Maximum Efficiency - Direct Bind)
+	// =========================================================
+	if len(expandedResolvers) == 1 {
+		tunnel, err := NewTunnel(expandedResolvers[0], tunnelServer)
+		if err != nil {
+			return fmt.Errorf("failed to create single tunnel: %w", err)
+		}
+		o.tunnels = []*Tunnel{tunnel}
+		log.Infof("[Tunnel] Booting natively optimized Single-Path Tunnel on %s", bind)
+		return tunnel.ListenAndServe(bind)
+	}
+
+	// =========================================================
+	// PATH B: MULTIPATH LOAD BALANCER (Round-Robin Aggregation)
+	// =========================================================
+	for _, resolver := range expandedResolvers {
+		tunnel, err := NewTunnel(resolver, tunnelServer)
+		if err != nil {
+			log.Warnf("Failed to create tunnel for %s: %v", resolver.ResolverAddr, err)
+			continue
+		}
+
+		// Start background session manager for this specific tunnel on an ephemeral port
+		go func(t *Tunnel, targetAddr string) {
+			log.Infof("[Multipath] Booting concurrent tunnel path via %s", targetAddr)
+			if err := t.ListenAndServe("127.0.0.1:0"); err != nil {
+				log.Warnf("Tunnel path %s collapsed: %v", targetAddr, err)
+			}
+		}(tunnel, resolver.ResolverAddr)
+
+		o.tunnels = append(o.tunnels, tunnel)
+	}
+
+	if len(o.tunnels) == 0 {
+		return fmt.Errorf("all multipath tunnels failed to initialize")
+	}
+
+	// Open the single local listener on bind
+	localAddr, err := net.ResolveTCPAddr("tcp", bind)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %v", err)
+	}
+	ln, err := net.ListenTCP("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("opening local listener: %v", err)
+	}
+	defer ln.Close()
+
+	log.Infof("[Multipath] Load Balancer active on %s routing across %d tunnels", bind, len(o.tunnels))
+
+	var tunnelIndex uint64 = 0
+
+	for {
+		localConn, err := ln.AcceptTCP()
+		if err != nil {
+			log.Warnf("Local accept error: %v", err)
+			continue
+		}
+
+		idx := atomic.AddUint64(&tunnelIndex, 1) % uint64(len(o.tunnels))
+		selectedTunnel := o.tunnels[idx]
+
+		go func(conn *net.TCPConn, t *Tunnel) {
+			defer conn.Close()
+
+			t.mu.Lock()
+			sess := t.yamuxSession
+			conv := uint32(0)
+			if t.kcpConn != nil {
+				conv = t.kcpConn.GetConv()
+			}
+			t.mu.Unlock()
+
+			if sess == nil {
+				log.Warnf("Dropped connection: Multipath tunnel not ready yet")
+				return
+			}
+
+			if err := t.handleConn(conn, sess, conv); err != nil {
+				log.Warnf("Multipath handler error: %v", err)
+			}
+		}(localConn, selectedTunnel)
+	}
 }

@@ -9,8 +9,12 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
+	"math/rand"
+	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/net2share/vaydns/client"
@@ -31,7 +35,58 @@ func readKeyFromFile(filename string) ([]byte, error) {
 	return noise.ReadKey(f)
 }
 
+// roundRobinTCPRelay distributes incoming TCP streams evenly across multiple active backend tunnels
+func roundRobinTCPRelay(listenAddr string, backendPorts []int) error {
+	localAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %v", err)
+	}
+	ln, err := net.ListenTCP("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %v", listenAddr, err)
+	}
+	defer ln.Close()
+
+	log.Infof("[Multipath] Load Balancer active on %s, distributing across %d VayDNS tunnels", listenAddr, len(backendPorts))
+
+	var counter uint64
+	for {
+		clientConn, err := ln.Accept()
+		if err != nil {
+			log.Warnf("Load balancer accept error: %v", err)
+			continue
+		}
+
+		idx := atomic.AddUint64(&counter, 1) % uint64(len(backendPorts))
+		target := fmt.Sprintf("127.0.0.1:%d", backendPorts[idx])
+
+		go func(c net.Conn, backend string) {
+			defer c.Close()
+			remoteConn, err := net.Dial("tcp", backend)
+			if err != nil {
+				log.Warnf("Load Balancer dropped stream: Backend %s unreachable: %v", backend, err)
+				return
+			}
+			defer remoteConn.Close()
+
+			done := make(chan struct{}, 2)
+			go func() {
+				io.Copy(remoteConn, c)
+				done <- struct{}{}
+			}()
+			go func() {
+				io.Copy(c, remoteConn)
+				done <- struct{}{}
+			}()
+			<-done
+			<-done
+		}(clientConn, target)
+	}
+}
+
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	var showVersion bool
 	var dohURL string
 	var dotAddr string
@@ -66,19 +121,20 @@ func main() {
 	var uploadMaxMTU int
 	var downloadMinMTU int
 	var downloadMaxMTU int
-	
+
 	// --- NEW FLAGS ---
 	var disableDynamicMTU bool
 	var fixedMTU int
 	var mtuDiscoveryRetries int
-	
+	var multiResolverCount int
+
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s [-doh URL|-dot ADDR|-tcp ADDR|-udp ADDR] -pubkey-file PUBKEYFILE -domain DOMAIN -listen LOCALADDR  
 
 Examples:
   %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
-  %[1]s -dot resolver.example:853 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
+  %[1]s -udp 8.8.8.8:53,8.8.4.4:53,208.67.222.222:53 -use-multi-resolver 3 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000
   %[1]s -tcp resolver.example:53 -pubkey-file server.pub -domain t.example.com -listen 127.0.0.1:7000  
 
 `, os.Args[0])
@@ -121,12 +177,13 @@ Known TLS fingerprints for -utls are:
 			fmt.Fprintln(flag.CommandLine.Output(), line.String())
 		}
 	}
-	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
-	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
-	flag.StringVar(&tcpAddr, "tcp", "", "address of TCP DNS resolver")	
+	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver (comma-separated for multi-resolver)")
+	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver (comma-separated for multi-resolver)")
+	flag.StringVar(&tcpAddr, "tcp", "", "address of TCP DNS resolver (comma-separated for multi-resolver)")	
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
-	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver")
+	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver (comma-separated for multi-resolver)")
+	flag.IntVar(&multiResolverCount, "use-multi-resolver", 3, "number of resolvers to use for multi-path load balancing (1-4, default 3; 1 uses single/racing logic)")
 	flag.StringVar(&utlsDistribution, "utls",
 		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
 		"choose TLS fingerprint from weighted distribution")
@@ -170,6 +227,11 @@ Known TLS fingerprints for -utls are:
 	if showVersion {
 		fmt.Println(version)
 		os.Exit(0)
+	}
+
+	if multiResolverCount < 1 || multiResolverCount > 4 {
+		fmt.Fprintf(os.Stderr, "-use-multi-resolver must be between 1 and 4 (inclusive)\n")
+		os.Exit(1)
 	}
 
 	level, err := log.ParseLevel(logLevel)
@@ -384,7 +446,6 @@ Known TLS fingerprints for -utls are:
 		if !explicitFlags["keepalive"] {
 			keepAlive = client.DnsttKeepAlive
 		}
-		// Re-validate after overrides.
 		if keepAlive >= idleTimeout {
 			fmt.Fprintf(os.Stderr, "-keepalive (%s) must be less than -idle-timeout (%s)\n", keepAlive, idleTimeout)
 			os.Exit(1)
@@ -392,32 +453,12 @@ Known TLS fingerprints for -utls are:
 		
 		if !explicitFlags["download-max-mtu"] {
 			if resolverType == client.ResolverTypeTCP || resolverType == client.ResolverTypeDOT || resolverType == client.ResolverTypeDOH {
-			downloadMaxMTU = 1232
+				downloadMaxMTU = 1232
 			}
 		}		
 	}
 
-	
-	// Build resolver.
-	resolver, err := client.NewResolver(resolverType, resolverAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolver: %v\n", err)
-		os.Exit(1)
-	}
-	resolver.UTLSClientHelloID = utlsClientHelloID
-	resolver.UDPWorkers = udpWorkers
-	resolver.UDPSharedSocket = udpSharedSocket
-	resolver.UDPTimeout = udpTimeout
-	resolver.UDPAcceptErrors = udpAcceptErrors
-	if udpAcceptErrors {
-		if udpSharedSocket {
-			log.Warnf("-udp-accept-errors has no effect when -udp-shared-socket is set")
-		} else {
-			log.Warnf("-udp-accept-errors disables forged response filtering; per-query workers will accept the first response regardless of RCODE, which may cause connection failures under DNS injection")
-		}
-	}
-
-	// Build tunnel server config.
+	// Build base tunnel server config.
 	ts, err := client.NewTunnelServer(domainArg, pubkeyHex)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -433,29 +474,9 @@ Known TLS fingerprints for -utls are:
 	ts.UploadMaxMTU = uploadMaxMTU
 	ts.DownloadMinMTU = downloadMinMTU
 	ts.DownloadMaxMTU = downloadMaxMTU
-	
-	// --- MAP NEW FLAGS ---
 	ts.DisableDynamicMTU = disableDynamicMTU
 	ts.MTU = fixedMTU
 	ts.MTUDiscoveryRetries = mtuDiscoveryRetries
-	
-	// Build tunnel.
-	tunnel, err := client.NewTunnel(resolver, ts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	tunnel.IdleTimeout = idleTimeout
-	tunnel.KeepAlive = keepAlive
-	tunnel.OpenStreamTimeout = openStreamTimeout
-	tunnel.MaxStreams = maxStreams
-	tunnel.ReconnectMinDelay = reconnectMinDelay
-	tunnel.ReconnectMaxDelay = reconnectMaxDelay
-	tunnel.SessionCheckInterval = sessionCheckInterval
-	tunnel.PacketQueueSize = queueSize
-	tunnel.KCPWindowSize = kcpWindowSize
-	tunnel.QueueOverflowMode = queueOverflowMode
-	log.Infof("transport config: queue-size=%d kcp-window-size=%d queue-overflow=%s", queueSize, kcpWindowSize, queueOverflowMode)
 
 	if compatDnstt {
 		log.Infof("wire config: clientid-size=8 compat=true")
@@ -467,8 +488,102 @@ Known TLS fingerprints for -utls are:
 		log.Infof("rate limiting DNS queries to %.1f requests per second", rpsLimit)
 	}
 
-	err = tunnel.ListenAndServe(listenAddr)
-	if err != nil {
-		log.Fatalf("%v", err)
+	// Helper function to build a configured Tunnel instance for a given resolver address
+	createTunnelInstance := func(targetAddr string) (*client.Tunnel, error) {
+		r, err := client.NewResolver(resolverType, targetAddr)
+		if err != nil {
+			return nil, fmt.Errorf("resolver creation error: %w", err)
+		}
+		r.UTLSClientHelloID = utlsClientHelloID
+		r.UDPWorkers = udpWorkers
+		r.UDPSharedSocket = udpSharedSocket
+		r.UDPTimeout = udpTimeout
+		r.UDPAcceptErrors = udpAcceptErrors
+
+		t, err := client.NewTunnel(r, ts)
+		if err != nil {
+			return nil, fmt.Errorf("tunnel creation error: %w", err)
+		}
+		t.IdleTimeout = idleTimeout
+		t.KeepAlive = keepAlive
+		t.OpenStreamTimeout = openStreamTimeout
+		t.MaxStreams = maxStreams
+		t.ReconnectMinDelay = reconnectMinDelay
+		t.ReconnectMaxDelay = reconnectMaxDelay
+		t.SessionCheckInterval = sessionCheckInterval
+		t.PacketQueueSize = queueSize
+		t.KCPWindowSize = kcpWindowSize
+		t.QueueOverflowMode = queueOverflowMode
+		return t, nil
+	}
+
+	// Parse comma-separated resolvers
+	rawResolvers := strings.Split(resolverAddr, ",")
+	var cleanResolvers []string
+	for _, r := range rawResolvers {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			cleanResolvers = append(cleanResolvers, r)
+		}
+	}
+	if len(cleanResolvers) == 0 {
+		fmt.Fprintf(os.Stderr, "no valid resolver addresses specified\n")
+		os.Exit(1)
+	}
+
+	// =========================================================================
+	// PATH A: RACING / SINGLE RESOLVER (N == 1 or only 1 resolver specified)
+	// =========================================================================
+	if multiResolverCount == 1 || len(cleanResolvers) <= 1 {
+		log.Infof("[Tunnel] Spawning single tunnel engine (Racing/Single mode)")
+		// Pass the raw resolverAddr (which can be comma-separated for internal racing)
+		tunnel, err := createTunnelInstance(resolverAddr)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		log.Infof("transport config: queue-size=%d kcp-window-size=%d queue-overflow=%s", queueSize, kcpWindowSize, queueOverflowMode)
+		if err := tunnel.ListenAndServe(listenAddr); err != nil {
+			log.Fatalf("%v", err)
+		}
+		return
+	}
+
+	// =========================================================================
+	// PATH B: MULTIPATH LOAD BALANCER (N > 1 with multiple resolvers)
+	// =========================================================================
+	selectedResolvers := cleanResolvers
+	if len(selectedResolvers) > multiResolverCount {
+		selectedResolvers = selectedResolvers[:multiResolverCount]
+	}
+
+	var backendPorts []int
+	usedPorts := make(map[int]bool)
+
+	for _, singleAddr := range selectedResolvers {
+		var bgPort int
+		for {
+			bgPort = 40000 + rand.Intn(10000)
+			if !usedPorts[bgPort] {
+				usedPorts[bgPort] = true
+				break
+			}
+		}
+		backendPorts = append(backendPorts, bgPort)
+
+		bgTunnel, err := createTunnelInstance(singleAddr)
+		if err != nil {
+			log.Fatalf("failed to create tunnel for %s: %v", singleAddr, err)
+		}
+
+		go func(t *client.Tunnel, addr string, port int) {
+			log.Infof("[Multipath] Booting dedicated tunnel path for %s on port 127.0.0.1:%d", addr, port)
+			if err := t.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port)); err != nil {
+				log.Warnf("Tunnel path %s on port %d exited: %v", addr, port, err)
+			}
+		}(bgTunnel, singleAddr, bgPort)
+	}
+
+	if err := roundRobinTCPRelay(listenAddr, backendPorts); err != nil {
+		log.Fatalf("Load balancer relay error: %v", err)
 	}
 }
