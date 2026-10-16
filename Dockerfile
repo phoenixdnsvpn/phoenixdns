@@ -6,10 +6,10 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /vaydns-server ./vaydns-server
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /vaydns-client ./vaydns-client
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /phoenixdns-server ./phoenixdns-server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /phoenixdns-client ./phoenixdns-client
 
 FROM alpine
 RUN apk add --no-cache curl
-COPY --from=build /vaydns-server /usr/local/bin/
-COPY --from=build /vaydns-client /usr/local/bin/
+COPY --from=build /phoenixdns-server /usr/local/bin/
+COPY --from=build /phoenixdns-client /usr/local/bin/
